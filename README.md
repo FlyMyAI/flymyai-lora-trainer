@@ -54,8 +54,8 @@ Agentic Infra for GenAI. FlyMy.AI is a B2B infrastructure for building and runni
 
 1. Clone the repository and navigate into it:
    ```bash
-   git clone https://github.com/FlyMyAI/qwen-image-lora-trainer
-   cd qwen-image-lora-trainer
+   git clone https://github.com/FlyMyAI/flymyai-lora-trainer
+   cd flymyai-lora-trainer
    ```
 
 2. Install required packages:
