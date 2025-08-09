@@ -160,7 +160,7 @@ def main():
     del text_encoding_pipeline
     gc.collect()
 
-    
+
     vae = AutoencoderKLQwenImage.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="vae",
@@ -181,7 +181,7 @@ def main():
                 img = img.permute(2, 0, 1).unsqueeze(0)
                 pixel_values = img.unsqueeze(2)
                 pixel_values = pixel_values.to(dtype=weight_dtype).to(accelerator.device)
-        
+
                 pixel_latents = vae.encode(pixel_values).latent_dist.sample().to('cpu')[0]
                 cached_image_embeddings[img_name] = pixel_latents
         vae.to('cpu')
@@ -205,7 +205,7 @@ def main():
         freeze(flux_transformer)
         #quantize(flux_transformer, weights=qint8, activations=qint8)
         #freeze(flux_transformer)
-        
+
     lora_config = LoraConfig(
         r=args.rank,
         lora_alpha=args.rank,
@@ -229,12 +229,12 @@ def main():
         schedule_timesteps = noise_scheduler_copy.timesteps.to(accelerator.device)
         timesteps = timesteps.to(accelerator.device)
         step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
-    
+
         sigma = sigmas[step_indices].flatten()
         while len(sigma.shape) < n_dim:
             sigma = sigma.unsqueeze(-1)
         return sigma
-        
+
     flux_transformer.requires_grad_(False)
 
 
@@ -265,6 +265,15 @@ def main():
         )
     train_dataloader = loader(cached_text_embeddings=cached_text_embeddings, cached_image_embeddings=cached_image_embeddings, **args.data_config)
 
+    # Calculate total number of epochs
+    total_samples = len(train_dataloader.dataset) if hasattr(train_dataloader, 'dataset') else len(train_dataloader)
+    steps_per_epoch = len(train_dataloader)
+    total_epochs = max(1, args.max_train_steps // steps_per_epoch)
+
+    logger.info(f"Total samples: {total_samples}")
+    logger.info(f"Steps per epoch: {steps_per_epoch}")
+    logger.info(f"Total epochs: {total_epochs}")
+
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
         optimizer=optimizer,
@@ -282,7 +291,37 @@ def main():
     initial_global_step = 0
 
     if accelerator.is_main_process:
-        accelerator.init_trackers(args.tracker_project_name, {"test": None})
+        # Initialize W&B tracking with more comprehensive config
+        wandb_config = {
+            "model": args.pretrained_model_name_or_path,
+            "learning_rate": args.learning_rate,
+            "lr_scheduler": args.lr_scheduler,
+            "lr_warmup_steps": args.lr_warmup_steps,
+            "train_batch_size": args.train_batch_size,
+            "gradient_accumulation_steps": args.gradient_accumulation_steps,
+            "max_train_steps": args.max_train_steps,
+            "total_epochs": total_epochs,
+            "steps_per_epoch": steps_per_epoch,
+            "mixed_precision": args.mixed_precision,
+            "rank": args.rank,
+            "checkpointing_steps": args.checkpointing_steps,
+            "quantize": args.quantize,
+            "adam8bit": args.adam8bit,
+            "precompute_text_embeddings": args.precompute_text_embeddings,
+            "precompute_image_embeddings": args.precompute_image_embeddings,
+        }
+
+        # Add W&B specific config if available
+        if hasattr(args, 'wandb_project_name'):
+            wandb_config["wandb_project_name"] = args.wandb_project_name
+        if hasattr(args, 'wandb_run_name'):
+            wandb_config["wandb_run_name"] = args.wandb_run_name
+        if hasattr(args, 'wandb_entity'):
+            wandb_config["wandb_entity"] = args.wandb_entity
+        if hasattr(args, 'wandb_tags'):
+            wandb_config["wandb_tags"] = args.wandb_tags
+
+        accelerator.init_trackers(args.tracker_project_name, wandb_config)
 
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
@@ -290,6 +329,7 @@ def main():
     logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
+    logger.info(f"  Total epochs: {total_epochs}")
     progress_bar = tqdm(
         range(0, args.max_train_steps),
         initial=initial_global_step,
@@ -297,8 +337,21 @@ def main():
         disable=not accelerator.is_local_main_process,
     )
     vae_scale_factor = 2 ** len(vae.temperal_downsample)
-    for epoch in range(1):
-        train_loss = 0.0
+
+    # Initialize epoch tracking
+    current_epoch = 0
+    epoch_loss = 0.0
+    epoch_step_count = 0
+    train_loss = 0.0  # Initialize train_loss here
+
+    for epoch in range(total_epochs):
+        current_epoch = epoch + 1
+        epoch_loss = 0.0
+        epoch_step_count = 0
+        train_loss = 0.0  # Reset train_loss for each epoch
+
+        logger.info(f"Starting epoch {current_epoch}/{total_epochs}")
+
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(flux_transformer):
                 if args.precompute_text_embeddings:
@@ -310,7 +363,7 @@ def main():
                     if not args.precompute_image_embeddings:
                         pixel_values = img.to(dtype=weight_dtype).to(accelerator.device)
                         pixel_values = pixel_values.unsqueeze(2)
-    
+
                         pixel_latents = vae.encode(pixel_values).latent_dist.sample()
                     else:
                         pixel_latents = img.to(dtype=weight_dtype).to(accelerator.device)
@@ -325,7 +378,7 @@ def main():
                         pixel_latents.device, pixel_latents.dtype
                     )
                     pixel_latents = (pixel_latents - latents_mean) * latents_std
-                    
+
 
                     bsz = pixel_latents.shape[0]
                     noise = torch.randn_like(pixel_latents, device=accelerator.device, dtype=weight_dtype)
@@ -345,7 +398,7 @@ def main():
                 # pack the latents.
                 packed_noisy_model_input = QwenImagePipeline._pack_latents(
                     noisy_model_input,
-                    bsz, 
+                    bsz,
                     noisy_model_input.shape[2],
                     noisy_model_input.shape[3],
                     noisy_model_input.shape[4],
@@ -389,6 +442,7 @@ def main():
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
+                epoch_loss += avg_loss.item() / args.gradient_accumulation_steps
 
                 # Backpropagate
                 accelerator.backward(loss)
@@ -402,7 +456,20 @@ def main():
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
-                accelerator.log({"train_loss": train_loss}, step=global_step)
+                epoch_step_count += 1
+
+                # Get current learning rate
+                current_lr = lr_scheduler.get_last_lr()[0]
+
+                # Log comprehensive metrics to W&B
+                accelerator.log({
+                    "train_loss": train_loss,
+                    "learning_rate": current_lr,
+                    "epoch": current_epoch,
+                    "epoch_progress": epoch_step_count / steps_per_epoch,
+                    "global_step": global_step,
+                }, step=global_step)
+
                 train_loss = 0.0
 
                 if global_step % args.checkpointing_steps == 0:
@@ -453,6 +520,40 @@ def main():
 
             if global_step >= args.max_train_steps:
                 break
+
+        # Log epoch-level metrics
+        if epoch_step_count > 0:
+            avg_epoch_loss = epoch_loss / epoch_step_count
+            accelerator.log({
+                "epoch_loss": avg_epoch_loss,
+                "epoch": current_epoch,
+                "epoch_complete": True,
+            }, step=global_step)
+            logger.info(f"Epoch {current_epoch} completed. Average loss: {avg_epoch_loss:.4f}")
+
+            # Log additional epoch statistics
+            if accelerator.is_main_process:
+                logger.info(f"Epoch {current_epoch} Summary:")
+                logger.info(f"  - Steps completed: {epoch_step_count}")
+                logger.info(f"  - Average loss: {avg_epoch_loss:.6f}")
+                logger.info(f"  - Current learning rate: {lr_scheduler.get_last_lr()[0]:.2e}")
+                logger.info(f"  - Global step: {global_step}")
+                logger.info(f"  - Progress: {global_step}/{args.max_train_steps} ({100*global_step/args.max_train_steps:.1f}%)")
+
+    # Final logging
+    if accelerator.is_main_process:
+        logger.info("Training completed!")
+        logger.info(f"Total steps: {global_step}")
+        logger.info(f"Total epochs: {current_epoch}")
+        logger.info(f"Final learning rate: {lr_scheduler.get_last_lr()[0]:.2e}")
+
+        # Log final metrics
+        accelerator.log({
+            "training_complete": True,
+            "final_global_step": global_step,
+            "final_epoch": current_epoch,
+            "final_learning_rate": lr_scheduler.get_last_lr()[0],
+        }, step=global_step)
 
     accelerator.wait_for_everyone()
     accelerator.end_training()
