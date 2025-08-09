@@ -7,7 +7,11 @@ data_config:
   img_dir: ./your_lora_dataset
   random_ratio: false # support multi crop preprocessing
   caption_type: txt
-report_to: null
+report_to: wandb
+wandb_project_name: qwen-lora-training
+wandb_run_name: lora-4090-run
+wandb_entity: null  # Set to your W&B username/team if desired
+wandb_tags: ["lora", "qwen", "text-to-image", "4090"]
 train_batch_size: 1
 output_dir: ./test_lora_saves
 max_train_steps: 3000
