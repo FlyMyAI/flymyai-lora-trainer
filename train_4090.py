@@ -1,6 +1,7 @@
 import argparse
 import copy
 from copy import deepcopy
+import json
 import logging
 import os
 import shutil
@@ -38,6 +39,7 @@ import bitsandbytes as bnb
 logger = get_logger(__name__, log_level="INFO")
 from diffusers.loaders import AttnProcsLayers
 import gc
+from custom_wandb_tracker import CustomWandbTracker
 
 
 def parse_args():
@@ -94,8 +96,22 @@ def compute_validation_loss(flux_transformer, vae, text_encoding_pipeline, noise
     total_val_loss = 0.0
     num_val_batches = 0
 
+    logger.info(f"Starting validation on {len(validation_dataloader)} batches")
+
+    # Calculate actual validation batches based on validation dataset size
+    # This prevents infinite loops while processing the actual validation data
+    max_val_batches = len(validation_dataloader)
+    logger.info(f"Processing all {max_val_batches} validation batches")
+
     with torch.no_grad():
-        for val_batch in validation_dataloader:
+        for batch_idx, val_batch in enumerate(validation_dataloader):
+            logger.info(f"Processing validation batch {batch_idx + 1}/{max_val_batches}")
+
+            # Break after processing max_val_batches to prevent infinite loops
+            if num_val_batches >= max_val_batches:
+                logger.info(f"Reached maximum validation batches ({max_val_batches}), stopping validation")
+                break
+
             if num_val_batches == 0:  # Log batch structure only once
                 logger.info(f"Validation batch structure: {len(val_batch)} items")
                 if len(val_batch) == 3:
@@ -104,6 +120,15 @@ def compute_validation_loss(flux_transformer, vae, text_encoding_pipeline, noise
                     logger.info("Batch contains: [raw_images, raw_texts]")
                 else:
                     logger.warning(f"Unexpected batch structure with {len(val_batch)} items")
+
+                # Log batch shapes for debugging
+                if len(val_batch) == 3:
+                    logger.info(f"Image embeddings shape: {val_batch[0].shape if hasattr(val_batch[0], 'shape') else 'N/A'}")
+                    logger.info(f"Text embeddings shape: {val_batch[1].shape if hasattr(val_batch[1], 'shape') else 'N/A'}")
+                    logger.info(f"Text masks shape: {val_batch[2].shape if hasattr(val_batch[2], 'shape') else 'N/A'}")
+                elif len(val_batch) == 2:
+                    logger.info(f"Raw images shape: {val_batch[0].shape if hasattr(val_batch[0], 'shape') else 'N/A'}")
+                    logger.info(f"Raw texts type: {type(val_batch[1])}")
 
             if len(val_batch) == 3:  # With cached embeddings
                 img, prompt_embeds, prompt_embeds_mask = val_batch
@@ -126,14 +151,16 @@ def compute_validation_loss(flux_transformer, vae, text_encoding_pipeline, noise
             # Handle image processing
             if isinstance(img, torch.Tensor):  # Cached embeddings
                 pixel_latents = img.to(dtype=weight_dtype).to(accelerator.device)
-                if num_val_batches == 0:  # Log only once
+                if num_val_batches == 0: # Log only once
                     logger.info("Using cached validation image embeddings")
             else:  # Raw images
-                if num_val_batches == 0:  # Log only once
+                if num_val_batches == 0: # Log only once
                     logger.info("Computing validation image embeddings on-the-fly")
                 pixel_values = img.to(dtype=weight_dtype).to(accelerator.device)
                 pixel_values = pixel_values.unsqueeze(2)
                 pixel_latents = vae.encode(pixel_values).latent_dist.sample()
+
+            logger.info(f"Processing batch {batch_idx + 1}: pixel_latents shape = {pixel_latents.shape}")
 
             pixel_latents = pixel_latents.permute(0, 2, 1, 3, 4)
 
@@ -148,6 +175,8 @@ def compute_validation_loss(flux_transformer, vae, text_encoding_pipeline, noise
             pixel_latents = (pixel_latents - latents_mean) * latents_std
 
             bsz = pixel_latents.shape[0]
+            logger.info(f"Batch size: {bsz}")
+
             noise = torch.randn_like(pixel_latents, device=accelerator.device, dtype=weight_dtype)
             u = compute_density_for_timestep_sampling(
                 weighting_scheme="none",
@@ -174,6 +203,7 @@ def compute_validation_loss(flux_transformer, vae, text_encoding_pipeline, noise
 
             txt_seq_lens = prompt_embeds_mask.sum(dim=1).tolist()
 
+            logger.info(f"Running flux_transformer forward pass for batch {batch_idx + 1}...")
             model_pred = flux_transformer(
                 hidden_states=packed_noisy_model_input,
                 timestep=timesteps / 1000,
@@ -184,6 +214,7 @@ def compute_validation_loss(flux_transformer, vae, text_encoding_pipeline, noise
                 txt_seq_lens=txt_seq_lens,
                 return_dict=False,
             )[0]
+            logger.info(f"Forward pass completed for batch {batch_idx + 1}")
 
             vae_scale_factor = 2 ** len(vae.temperal_downsample)
             model_pred = QwenImagePipeline._unpack_latents(
@@ -205,6 +236,8 @@ def compute_validation_loss(flux_transformer, vae, text_encoding_pipeline, noise
             total_val_loss += loss.item()
             num_val_batches += 1
 
+            logger.info(f"Batch {batch_idx + 1} loss: {loss.item():.6f}, cumulative loss: {total_val_loss:.6f}")
+
     avg_val_loss = total_val_loss / num_val_batches if num_val_batches > 0 else 0.0
     logger.info(f"Validation completed: {num_val_batches} batches, average loss: {avg_val_loss:.6f}")
     flux_transformer.train()
@@ -215,12 +248,42 @@ def main():
     args = OmegaConf.load(parse_args())
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
 
+    # Initialize W&B tracking with more comprehensive config
+    wandb_config = {
+        key: value for key, value in args.items() if key not in ['wandb_run_name', 'wandb_project_name', 'wandb_entity', 'wandb_tags']
+        # "total_epochs": total_epochs,
+        # "steps_per_epoch": steps_per_epoch,
+        # "optimizer": getattr(args, 'optimizer', 'adam'),
+    }
+
+    # Add optimizer-specific parameters to W&B config
+    if hasattr(args, 'optimizer_args'):
+        wandb_config["optimizer_args"] = args.optimizer_args
+
+    # Add validation config to W&B if available
+    if hasattr(args, 'validation_config') and args.validation_config is not None:
+        wandb_config["validation_batch_size"] = args.validation_config.get("train_batch_size", "N/A")
+        wandb_config["validation_img_size"] = args.validation_config.get("img_size", "N/A")
+        wandb_config["validation_img_dir"] = args.validation_config.get("img_dir", "N/A")
+
+    # Initialize custom W&B tracker
+    wandb_tracker = CustomWandbTracker(
+        run_name=args.wandb_run_name,
+        project_name=args.wandb_project_name,
+        entity=args.wandb_entity,
+        tags=args.wandb_tags,
+        config=wandb_config,
+    )
+
+    wandb_tracker.store_init_configuration(wandb_config)
+
+
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
-        log_with=args.report_to,
+        log_with=[wandb_tracker],
         project_config=accelerator_project_config,
     )
     def unwrap_model(model):
@@ -245,6 +308,7 @@ def main():
         diffusers.utils.logging.set_verbosity_error()
 
     if accelerator.is_main_process:
+        accelerator.init_trackers(args.wandb_project_name, config=wandb_config)
         if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
     weight_dtype = torch.float32
@@ -317,10 +381,12 @@ def main():
     flux_transformer = QwenImageTransformer2DModel.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="transformer",    )
+
     if args.quantize:
         torch_dtype = weight_dtype
         device = accelerator.device
         all_blocks = list(flux_transformer.transformer_blocks)
+        print(f"Quantizing {len(all_blocks)} blocks")
         for block in tqdm(all_blocks):
             block.to(device, dtype=torch_dtype)
             quantize(block, weights=qfloat8)
@@ -420,7 +486,6 @@ def main():
                     scale_parameter=optimizer_args.get('scale_parameter', True),
                     relative_step=optimizer_args.get('relative_step', True),
                     warmup_init=optimizer_args.get('warmup_init', True),
-                    lr=optimizer_args.get('lr', args.learning_rate),
                 )
             except ImportError:
                 logger.warning("Adafactor not available, falling back to AdamW")
@@ -452,16 +517,7 @@ def main():
                     d_coef=optimizer_args.get('d_coef', 0.1),
                 )
             except ImportError:
-                logger.warning("Prodigy not available, falling back to AdamW")
-                optimizer_type = 'adam'
-                optimizer_cls = torch.optim.AdamW
-                optimizer = optimizer_cls(
-                    lora_layers,
-                    lr=args.learning_rate,
-                    betas=tuple(optimizer_args.get('betas', [0.9, 0.999])),
-                    weight_decay=optimizer_args.get('weight_decay', 0.01),
-                    eps=optimizer_args.get('epsilon', 1e-8),
-                )
+                raise ImportError("Prodigy not available, please install it with `pip install prodigyopt`")
         else:
             logger.warning(f"Unknown optimizer type '{optimizer_type}', falling back to AdamW")
             optimizer_type = 'adam'
@@ -474,7 +530,7 @@ def main():
                 eps=optimizer_args.get('epsilon', 1e-8),
             )
 
-    logger.info(f"Using {optimizer_type.upper()} optimizer")
+    logger.info(f"Using {optimizer_type.title()} optimizer")
     train_dataloader = loader(cached_text_embeddings=cached_text_embeddings, cached_image_embeddings=cached_image_embeddings, **args.data_config)
 
     # Setup validation dataset if validation_config is provided
@@ -559,6 +615,17 @@ def main():
         )
         logger.info(f"Validation dataset loaded with {len(validation_dataloader)} batches")
 
+        # Additional validation dataset debugging info
+        if hasattr(validation_dataloader, 'dataset'):
+            logger.info(f"Validation dataset has {len(validation_dataloader.dataset)} samples")
+            logger.info(f"Validation batch size: {args.validation_config.train_batch_size}")
+            logger.info(f"Expected batches: {len(validation_dataloader.dataset) // args.validation_config.train_batch_size}")
+        else:
+            logger.warning("Validation dataloader has no dataset attribute")
+
+        # Log validation config details
+        logger.info(f"Validation config: {args.validation_config}")
+
         # Log validation setup summary
         if val_cached_text_embeddings:
             logger.info(f"✓ Validation text embeddings: {len(val_cached_text_embeddings)} cached")
@@ -594,52 +661,6 @@ def main():
     )
 
     initial_global_step = 0
-
-    if accelerator.is_main_process:
-        # Initialize W&B tracking with more comprehensive config
-        wandb_config = {
-            "model": args.pretrained_model_name_or_path,
-            "learning_rate": args.learning_rate,
-            "lr_scheduler": args.lr_scheduler,
-            "lr_warmup_steps": args.lr_warmup_steps,
-            "train_batch_size": args.train_batch_size,
-            "gradient_accumulation_steps": args.gradient_accumulation_steps,
-            "max_train_steps": args.max_train_steps,
-            "total_epochs": total_epochs,
-            "steps_per_epoch": steps_per_epoch,
-            "mixed_precision": args.mixed_precision,
-            "rank": args.rank,
-            "checkpointing_steps": args.checkpointing_steps,
-            "quantize": args.quantize,
-            "adam8bit": args.adam8bit,
-            "precompute_text_embeddings": args.precompute_text_embeddings,
-            "precompute_image_embeddings": args.precompute_image_embeddings,
-            "optimizer": getattr(args, 'optimizer', 'adam'),
-        }
-
-        # Add optimizer-specific parameters to W&B config
-        if hasattr(args, 'optimizer_args'):
-            for key, value in args.optimizer_args.items():
-                wandb_config[f"optimizer_{key}"] = value
-
-        # Add validation config to W&B if available
-        if hasattr(args, 'validation_config') and args.validation_config is not None:
-            wandb_config["validation_batch_size"] = args.validation_config.get("train_batch_size", "N/A")
-            wandb_config["validation_img_size"] = args.validation_config.get("img_size", "N/A")
-            wandb_config["validation_img_dir"] = args.validation_config.get("img_dir", "N/A")
-
-        # Add W&B specific config if available
-        if hasattr(args, 'wandb_project_name'):
-            wandb_config["wandb_project_name"] = args.wandb_project_name
-        if hasattr(args, 'wandb_run_name'):
-            wandb_config["wandb_run_name"] = args.wandb_run_name
-        if hasattr(args, 'wandb_entity'):
-            wandb_config["wandb_entity"] = args.wandb_entity
-        if hasattr(args, 'wandb_tags'):
-            wandb_config["wandb_tags"] = args.wandb_tags
-
-        accelerator.init_trackers(args.tracker_project_name, wandb_config)
-
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
     logger.info("***** Running training *****")
@@ -786,9 +807,7 @@ def main():
                 accelerator.log({
                     "train_loss": train_loss,
                     "learning_rate": current_lr,
-                    "epoch": current_epoch,
                     "epoch_progress": epoch_step_count / steps_per_epoch,
-                    "global_step": global_step,
                 }, step=global_step)
 
                 train_loss = 0.0
@@ -851,16 +870,17 @@ def main():
                                 )
                                 val_text_pipeline.to(accelerator.device)
 
+                        logger.info(f"Starting checkpoint validation at step {global_step}...")
                         val_loss = compute_validation_loss(
                             flux_transformer, vae, val_text_pipeline, noise_scheduler_copy,
                             validation_dataloader, accelerator, weight_dtype, get_sigmas
                         )
-                        logger.info(f"Validation loss at step {global_step}: {val_loss:.6f}")
+                        logger.info(f"Checkpoint validation completed at step {global_step}: {val_loss:.6f}")
 
                         # Log validation loss to W&B
                         accelerator.log({
                             "validation_loss": val_loss,
-                            "global_step": global_step,
+                            "epoch_progress": epoch_step_count / steps_per_epoch,
                         }, step=global_step)
 
                         # Clean up temporary text pipeline if we created one
@@ -879,8 +899,7 @@ def main():
             avg_epoch_loss = epoch_loss / epoch_step_count
             accelerator.log({
                 "epoch_loss": avg_epoch_loss,
-                "epoch": current_epoch,
-                "epoch_complete": True,
+                "epoch_progress": epoch_step_count / steps_per_epoch,
             }, step=global_step)
             logger.info(f"Epoch {current_epoch} completed. Average loss: {avg_epoch_loss:.4f}")
 
@@ -899,17 +918,17 @@ def main():
                         )
                         val_text_pipeline.to(accelerator.device)
 
+                logger.info(f"Starting epoch {current_epoch} validation...")
                 val_loss = compute_validation_loss(
                     flux_transformer, vae, val_text_pipeline, noise_scheduler_copy,
                     validation_dataloader, accelerator, weight_dtype, get_sigmas
                 )
-                logger.info(f"Epoch {current_epoch} validation loss: {val_loss:.6f}")
+                logger.info(f"Epoch {current_epoch} validation completed: {val_loss:.6f}")
 
                 # Log epoch validation loss to W&B
                 accelerator.log({
                     "epoch_validation_loss": val_loss,
-                    "epoch": current_epoch,
-                    "epoch_complete": True,
+                    "epoch_progress": epoch_step_count / steps_per_epoch,
                 }, step=global_step)
 
                 # Clean up temporary text pipeline if we created one
@@ -935,13 +954,6 @@ def main():
         logger.info(f"Total epochs: {current_epoch}")
         logger.info(f"Final learning rate: {lr_scheduler.get_last_lr()[0]:.2e}")
 
-        # Log final metrics
-        accelerator.log({
-            "training_complete": True,
-            "final_global_step": global_step,
-            "final_epoch": current_epoch,
-            "final_learning_rate": lr_scheduler.get_last_lr()[0],
-        }, step=global_step)
 
     accelerator.wait_for_everyone()
     accelerator.end_training()
