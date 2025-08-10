@@ -364,7 +364,10 @@ def main():
     flux_transformer.requires_grad_(False)
 
     flux_transformer.train()
-    optimizer_cls = torch.optim.AdamW
+
+    # Set up optimizer based on configuration
+    optimizer_type = getattr(args, 'optimizer', 'adam').lower()
+
     for n, param in flux_transformer.named_parameters():
         if 'lora' not in n:
             param.requires_grad = False
@@ -376,18 +379,102 @@ def main():
     lora_layers = filter(lambda p: p.requires_grad, flux_transformer.parameters())
     lora_layers_model = AttnProcsLayers(lora_processors(flux_transformer))
     flux_transformer.enable_gradient_checkpointing()
+
+    # Get optimizer arguments from config
+    optimizer_args = getattr(args, 'optimizer_args', {})
+
     if args.adam8bit:
-        optimizer = bnb.optim.Adam8bit(lora_layers,
-            lr=args.learning_rate,
-            betas=(args.adam_beta1, args.adam_beta2),)
-    else:
-        optimizer = optimizer_cls(
-            lora_layers,
-            lr=args.learning_rate,
-            betas=(args.adam_beta1, args.adam_beta2),
-            weight_decay=args.adam_weight_decay,
-            eps=args.adam_epsilon,
-        )
+        # For 8-bit Adam, we need to handle the case where we might be using different optimizers
+        if optimizer_type == 'adam':
+            optimizer = bnb.optim.Adam8bit(
+                lora_layers,
+                lr=args.learning_rate,
+                betas=tuple(optimizer_args.get('betas', [0.9, 0.999])),
+                weight_decay=optimizer_args.get('weight_decay', 0.01),
+                eps=optimizer_args.get('epsilon', 1e-8),
+            )
+        else:
+            logger.warning("8-bit optimization only supported for Adam optimizer. Falling back to regular optimizer.")
+            args.adam8bit = False
+            optimizer_type = 'adam'
+
+    if not args.adam8bit:
+        if optimizer_type == 'adam':
+            optimizer_cls = torch.optim.AdamW
+            optimizer = optimizer_cls(
+                lora_layers,
+                lr=args.learning_rate,
+                betas=tuple(optimizer_args.get('betas', [0.9, 0.999])),
+                weight_decay=optimizer_args.get('weight_decay', 0.01),
+                eps=optimizer_args.get('epsilon', 1e-8),
+            )
+        elif optimizer_type == 'adafactor':
+            try:
+                from transformers import Adafactor
+                optimizer = Adafactor(
+                    lora_layers,
+                    lr=args.learning_rate,
+                    betas=tuple(optimizer_args.get('betas', [0.9, 0.999])),
+                    weight_decay=optimizer_args.get('weight_decay', 0.01),
+                    eps=optimizer_args.get('epsilon', 1e-8),
+                    scale_parameter=optimizer_args.get('scale_parameter', True),
+                    relative_step=optimizer_args.get('relative_step', True),
+                    warmup_init=optimizer_args.get('warmup_init', True),
+                    lr=optimizer_args.get('lr', args.learning_rate),
+                )
+            except ImportError:
+                logger.warning("Adafactor not available, falling back to AdamW")
+                optimizer_type = 'adam'
+                optimizer_cls = torch.optim.AdamW
+                optimizer = optimizer_cls(
+                    lora_layers,
+                    lr=args.learning_rate,
+                    betas=tuple(optimizer_args.get('betas', [0.9, 0.999])),
+                    weight_decay=optimizer_args.get('weight_decay', 0.01),
+                    eps=optimizer_args.get('epsilon', 1e-8),
+                )
+        elif optimizer_type == 'prodigy':
+            try:
+                from prodigyopt import Prodigy
+                # Prodigy uses three beta values
+                betas = optimizer_args.get('betas', [0.9, 0.999])
+                if len(betas) == 2:
+                    betas = betas + [optimizer_args.get('beta3', 0.999)]
+
+                optimizer = Prodigy(
+                    lora_layers,
+                    lr=args.learning_rate,
+                    betas=tuple(betas),
+                    weight_decay=optimizer_args.get('weight_decay', 0.01),
+                    eps=optimizer_args.get('epsilon', 1e-8),
+                    use_bias_correction=optimizer_args.get('use_bias_correction', True),
+                    safeguard_warmup=optimizer_args.get('safeguard_warmup', True),
+                    d_coef=optimizer_args.get('d_coef', 0.1),
+                )
+            except ImportError:
+                logger.warning("Prodigy not available, falling back to AdamW")
+                optimizer_type = 'adam'
+                optimizer_cls = torch.optim.AdamW
+                optimizer = optimizer_cls(
+                    lora_layers,
+                    lr=args.learning_rate,
+                    betas=tuple(optimizer_args.get('betas', [0.9, 0.999])),
+                    weight_decay=optimizer_args.get('weight_decay', 0.01),
+                    eps=optimizer_args.get('epsilon', 1e-8),
+                )
+        else:
+            logger.warning(f"Unknown optimizer type '{optimizer_type}', falling back to AdamW")
+            optimizer_type = 'adam'
+            optimizer_cls = torch.optim.AdamW
+            optimizer = optimizer_cls(
+                lora_layers,
+                lr=args.learning_rate,
+                betas=tuple(optimizer_args.get('betas', [0.9, 0.999])),
+                weight_decay=optimizer_args.get('weight_decay', 0.01),
+                eps=optimizer_args.get('epsilon', 1e-8),
+            )
+
+    logger.info(f"Using {optimizer_type.upper()} optimizer")
     train_dataloader = loader(cached_text_embeddings=cached_text_embeddings, cached_image_embeddings=cached_image_embeddings, **args.data_config)
 
     # Setup validation dataset if validation_config is provided
@@ -527,7 +614,13 @@ def main():
             "adam8bit": args.adam8bit,
             "precompute_text_embeddings": args.precompute_text_embeddings,
             "precompute_image_embeddings": args.precompute_image_embeddings,
+            "optimizer": getattr(args, 'optimizer', 'adam'),
         }
+
+        # Add optimizer-specific parameters to W&B config
+        if hasattr(args, 'optimizer_args'):
+            for key, value in args.optimizer_args.items():
+                wandb_config[f"optimizer_{key}"] = value
 
         # Add validation config to W&B if available
         if hasattr(args, 'validation_config') and args.validation_config is not None:
