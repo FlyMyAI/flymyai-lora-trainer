@@ -56,11 +56,12 @@ def crop_to_aspect_ratio(image, ratio="16:9"):
 
 
 class CustomImageDataset(Dataset):
-    def __init__(self, img_dir, img_size=512, caption_type='txt',
+    def __init__(self, img_dir, img_size=512, img_repeats=10, caption_type='txt',
                  random_ratio=False, caption_dropout_rate=0.1, cached_text_embeddings=None,
                  cached_image_embeddings=None):
         self.images = [os.path.join(img_dir, i) for i in os.listdir(img_dir) if '.jpg' in i or '.png' in i]
         self.images.sort()
+        self.img_repeats = img_repeats
         self.img_size = img_size
         self.caption_type = caption_type
         self.random_ratio = random_ratio
@@ -71,11 +72,11 @@ class CustomImageDataset(Dataset):
 
     def __len__(self):
         """Return the actual number of images in the dataset."""
-        return len(self.images)
+        return len(self.images) * self.img_repeats
 
     def __getitem__(self, idx):
         """Get item by index, with looping."""
-        idx = idx % len(self.images)
+        idx = idx % len(self.images) # does not include repeats because of the modulo operation
 
         try:
             # Use the actual index instead of random selection
