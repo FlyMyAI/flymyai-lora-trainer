@@ -160,7 +160,7 @@ def compute_validation_loss(flux_transformer, vae, text_encoding_pipeline, noise
                 pixel_values = pixel_values.unsqueeze(2)
                 pixel_latents = vae.encode(pixel_values).latent_dist.sample()
 
-            logger.info(f"Processing batch {batch_idx + 1}: pixel_latents shape = {pixel_latents.shape}")
+            logger.debug(f"Processing batch {batch_idx + 1}: pixel_latents shape = {pixel_latents.shape}")
 
             pixel_latents = pixel_latents.permute(0, 2, 1, 3, 4)
 
@@ -175,8 +175,6 @@ def compute_validation_loss(flux_transformer, vae, text_encoding_pipeline, noise
             pixel_latents = (pixel_latents - latents_mean) * latents_std
 
             bsz = pixel_latents.shape[0]
-            logger.info(f"Batch size: {bsz}")
-
             noise = torch.randn_like(pixel_latents, device=accelerator.device, dtype=weight_dtype)
             u = compute_density_for_timestep_sampling(
                 weighting_scheme="none",
@@ -203,7 +201,6 @@ def compute_validation_loss(flux_transformer, vae, text_encoding_pipeline, noise
 
             txt_seq_lens = prompt_embeds_mask.sum(dim=1).tolist()
 
-            logger.info(f"Running flux_transformer forward pass for batch {batch_idx + 1}...")
             model_pred = flux_transformer(
                 hidden_states=packed_noisy_model_input,
                 timestep=timesteps / 1000,
@@ -214,7 +211,6 @@ def compute_validation_loss(flux_transformer, vae, text_encoding_pipeline, noise
                 txt_seq_lens=txt_seq_lens,
                 return_dict=False,
             )[0]
-            logger.info(f"Forward pass completed for batch {batch_idx + 1}")
 
             vae_scale_factor = 2 ** len(vae.temperal_downsample)
             model_pred = QwenImagePipeline._unpack_latents(
@@ -236,7 +232,7 @@ def compute_validation_loss(flux_transformer, vae, text_encoding_pipeline, noise
             total_val_loss += loss.item()
             num_val_batches += 1
 
-            logger.info(f"Batch {batch_idx + 1} loss: {loss.item():.6f}, cumulative loss: {total_val_loss:.6f}")
+            logger.info(f"Batch {batch_idx + 1} loss: {loss.item():.6f}, average loss: {total_val_loss / num_val_batches:.6f}")
 
     avg_val_loss = total_val_loss / num_val_batches if num_val_batches > 0 else 0.0
     logger.info(f"Validation completed: {num_val_batches} batches, average loss: {avg_val_loss:.6f}")
@@ -879,7 +875,7 @@ def main():
 
                         # Log validation loss to W&B
                         accelerator.log({
-                            "validation_loss": val_loss,
+                            "checkpoint_validation_loss": val_loss,
                             "epoch_progress": epoch_step_count / steps_per_epoch,
                         }, step=global_step)
 

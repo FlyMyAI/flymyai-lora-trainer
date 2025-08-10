@@ -73,7 +73,7 @@ wandb_tags: ["lora", "qwen", "validation"]
 #    - Console output
 #    - W&B tracking
 # 3. Validation metrics include:
-#    - validation_loss: computed at checkpoints
+#    - checkpoint_validation_loss: computed at checkpoints
 #    - epoch_validation_loss: computed at end of each epoch
 #    - Both are logged with corresponding global_step and epoch numbers
 

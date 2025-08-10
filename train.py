@@ -513,7 +513,7 @@ def main():
 
                         # Log validation loss to W&B
                         accelerator.log({
-                            "validation_loss": val_loss,
+                            "checkpoint_validation_loss": val_loss,
                             "global_step": global_step,
                         }, step=global_step)
 
