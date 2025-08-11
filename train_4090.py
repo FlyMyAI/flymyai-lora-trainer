@@ -7,6 +7,7 @@ import os
 import shutil
 import hashlib
 import pickle
+import glob
 
 import torch
 from tqdm.auto import tqdm
@@ -42,6 +43,98 @@ logger = get_logger(__name__, log_level="INFO")
 from diffusers.loaders import AttnProcsLayers
 import gc
 from custom_wandb_tracker import CustomWandbTracker
+
+
+def find_latest_checkpoint(output_dir):
+    """Find the latest checkpoint in the output directory."""
+    if not os.path.exists(output_dir):
+        return None
+
+    # Look for checkpoint directories
+    checkpoint_dirs = glob.glob(os.path.join(output_dir, "checkpoint-*"))
+    if not checkpoint_dirs:
+        return None
+
+    # Extract step numbers and find the latest
+    checkpoint_steps = []
+    for checkpoint_dir in checkpoint_dirs:
+        try:
+            step = int(checkpoint_dir.split("-")[-1])
+            checkpoint_steps.append((step, checkpoint_dir))
+        except (ValueError, IndexError):
+            continue
+
+    if not checkpoint_steps:
+        return None
+
+    # Sort by step number and return the latest
+    latest_checkpoint = max(checkpoint_steps, key=lambda x: x[0])
+    return latest_checkpoint[1]
+
+
+def load_checkpoint(flux_transformer, checkpoint_path, accelerator):
+    """Load a LoRA checkpoint and return the global step.
+
+    Note: This loads only the LoRA weights into the LoRA adapter modules,
+    preserving the base model weights. The training will start from the
+    beginning of the dataset but with the loaded LoRA weights.
+    """
+    if not os.path.exists(checkpoint_path):
+        print(f"Checkpoint path {checkpoint_path} does not exist")
+        return 0
+
+    # Look for the safetensors file
+    safetensors_path = os.path.join(checkpoint_path, "pytorch_lora_weights.safetensors")
+    if not os.path.exists(safetensors_path):
+        print(f"LoRA weights file not found at {safetensors_path}")
+        return 0
+
+    try:
+        # Load the LoRA weights
+        print(f"Loading checkpoint from {safetensors_path}")
+
+        # Load the safetensors file directly
+        import safetensors.torch
+        checkpoint_state_dict = safetensors.torch.load_file(safetensors_path)
+
+        # Filter to only LoRA weights (keys containing 'lora')
+        lora_state_dict = {}
+        for key, value in checkpoint_state_dict.items():
+            if 'lora' in key:
+                lora_state_dict[key] = value
+
+        if not lora_state_dict:
+            print("No LoRA weights found in checkpoint")
+            return 0
+
+        print(f"Found {len(lora_state_dict)} LoRA weight keys")
+
+        # Load only the LoRA weights into the model
+        # This preserves the base model weights and only updates LoRA parameters
+        missing_keys, unexpected_keys = flux_transformer.load_state_dict(lora_state_dict, strict=False)
+
+        if missing_keys:
+            print(f"Missing keys when loading LoRA weights: {missing_keys[:5]}...")
+        if unexpected_keys:
+            print(f"Unexpected keys when loading LoRA weights: {unexpected_keys[:5]}...")
+
+        # Extract the step number from the checkpoint path
+        checkpoint_name = os.path.basename(checkpoint_path)
+        if checkpoint_name.startswith("checkpoint-"):
+            try:
+                step = int(checkpoint_name.split("-")[-1])
+                print(f"Successfully loaded LoRA checkpoint at step {step}")
+                return step
+            except ValueError:
+                print("Could not parse step number from checkpoint name")
+                return 0
+        else:
+            print("Checkpoint directory name format not recognized")
+            return 0
+
+    except Exception as e:
+        print(f"Failed to load checkpoint: {e}")
+        return 0
 
 
 def get_quantized_model_cache_path(model_path, weight_dtype, rank):
@@ -832,7 +925,9 @@ def main():
         num_warmup_steps=args.lr_warmup_steps * accelerator.num_processes,
         num_training_steps=args.max_train_steps * accelerator.num_processes,
     )
-    global_step = 0
+    # Initialize global step variable
+    initial_global_step = 0
+
     dataset1 = ToyDataset(num_samples=100, input_dim=10)
     dataloader1 = DataLoader(dataset1, batch_size=8, shuffle=True)
 
@@ -840,10 +935,47 @@ def main():
         lora_layers_model, optimizer, dataloader1, lr_scheduler
     )
 
-    initial_global_step = 0
+    # Handle checkpoint resuming
+    if hasattr(args, 'resume_from_checkpoint') and args.resume_from_checkpoint:
+        if args.resume_from_checkpoint == "latest":
+            # Find the latest checkpoint in the output directory
+            latest_checkpoint = find_latest_checkpoint(args.output_dir)
+            if latest_checkpoint:
+                logger.info(f"Found latest checkpoint: {latest_checkpoint}")
+                initial_global_step = load_checkpoint(flux_transformer, latest_checkpoint, accelerator)
+                if initial_global_step > 0:
+                    logger.info(f"Resuming training from step {initial_global_step}")
+                    # Note: Training will start from the beginning of the dataset
+                    # but the LoRA weights will continue from where they left off
+                else:
+                    logger.warning("Failed to load checkpoint, starting from step 0")
+            else:
+                logger.info("No checkpoints found, starting training from scratch")
+        else:
+            # Specific checkpoint path provided
+            if os.path.exists(args.resume_from_checkpoint):
+                initial_global_step = load_checkpoint(flux_transformer, args.resume_from_checkpoint, accelerator)
+                if initial_global_step > 0:
+                    logger.info(f"Resuming training from step {initial_global_step}")
+                    # Note: Training will start from the beginning of the dataset
+                    # but the LoRA weights will continue from where they left off
+                else:
+                    logger.warning("Failed to load checkpoint, starting from step 0")
+            else:
+                logger.warning(f"Checkpoint path {args.resume_from_checkpoint} does not exist, starting from scratch")
+
+    # Set global_step to the loaded checkpoint step (or 0 if starting fresh)
+    global_step = initial_global_step
+
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
     logger.info("***** Running training *****")
+    if initial_global_step > 0:
+        logger.info(f"  RESUMING LoRA weights from checkpoint at step {initial_global_step}")
+        logger.info(f"  Training will start from the beginning of the dataset")
+        logger.info(f"  Target total steps: {args.max_train_steps}")
+    else:
+        logger.info("  Starting training from scratch")
     logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
@@ -861,7 +993,7 @@ def main():
     )
     vae_scale_factor = 2 ** len(vae.temperal_downsample)
 
-    # Initialize epoch tracking
+            # Initialize epoch tracking
     current_epoch = 0
     epoch_loss = 0.0
     epoch_step_count = 0
