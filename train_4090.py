@@ -5,6 +5,8 @@ import json
 import logging
 import os
 import shutil
+import hashlib
+import pickle
 
 import torch
 from tqdm.auto import tqdm
@@ -40,6 +42,145 @@ logger = get_logger(__name__, log_level="INFO")
 from diffusers.loaders import AttnProcsLayers
 import gc
 from custom_wandb_tracker import CustomWandbTracker
+
+
+def get_quantized_model_cache_path(model_path, weight_dtype, rank):
+    """Generate a cache path for the quantized model based on model path, dtype, and rank."""
+    cache_dir = os.environ.get('QWEN_CACHE', os.path.expanduser('~/.cache/qwen_quantized'))
+    os.makedirs(cache_dir, exist_ok=True)
+
+    # Create a hash of the model path and configuration
+    config_str = f"{model_path}_{weight_dtype}_{rank}"
+    config_hash = hashlib.md5(config_str.encode()).hexdigest()
+
+    return os.path.join(cache_dir, f"quantized_model_{config_hash}.pkl")
+
+
+def validate_cache_integrity(cache_path):
+    """Validate that the cache file is not corrupted and can be loaded."""
+    try:
+        if not os.path.exists(cache_path):
+            return False
+
+        # Try to load and parse the cache file
+        with open(cache_path, 'rb') as f:
+            model_state = pickle.load(f)
+
+        # Basic validation - check if it's a dict and has some content
+        if not isinstance(model_state, dict) or len(model_state) == 0:
+            logger.warning(f"Cache file {cache_path} is corrupted or empty")
+            return False
+
+        return True
+    except Exception as e:
+        logger.warning(f"Cache file {cache_path} is corrupted: {e}")
+        return False
+
+
+def save_quantized_model(model, cache_path):
+    """Save the quantized model to cache."""
+    try:
+        # Save the model state dict
+        model_state = model.state_dict()
+
+        # Save to cache
+        with open(cache_path, 'wb') as f:
+            pickle.dump(model_state, f)
+
+        logger.info(f"Quantized model saved to cache: {cache_path}")
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to save quantized model to cache: {e}")
+        return False
+
+
+def load_quantized_model(model, cache_path):
+    """Load the quantized model from cache."""
+    try:
+        if not os.path.exists(cache_path):
+            return False
+
+        # Load from cache
+        with open(cache_path, 'rb') as f:
+            model_state = pickle.load(f)
+
+        # Check if the cached state dict is compatible
+        model_keys = set(model.state_dict().keys())
+        cache_keys = set(model_state.keys())
+
+        if model_keys != cache_keys:
+            logger.warning(f"Cache state dict has different keys. Expected: {len(model_keys)}, Got: {len(cache_keys)}")
+            missing_keys = model_keys - cache_keys
+            extra_keys = cache_keys - model_keys
+            if missing_keys:
+                logger.warning(f"Missing keys: {list(missing_keys)[:5]}...")
+            if extra_keys:
+                logger.warning(f"Extra keys: {list(extra_keys)[:5]}...")
+            return False
+
+        # Load the state dict
+        model.load_state_dict(model_state)
+
+        logger.info(f"Quantized model loaded from cache: {cache_path}")
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to load quantized model from cache: {e}")
+        return False
+
+
+def clear_old_cache_files(cache_dir, max_age_days=7):
+    """Clear old cache files to prevent disk space issues."""
+    try:
+        import time
+        current_time = time.time()
+        max_age_seconds = max_age_days * 24 * 3600
+
+        for filename in os.listdir(cache_dir):
+            file_path = os.path.join(cache_dir, filename)
+            if os.path.isfile(file_path):
+                file_age = current_time - os.path.getmtime(file_path)
+                if file_age > max_age_seconds:
+                    os.remove(file_path)
+                    logger.info(f"Removed old cache file: {filename}")
+    except Exception as e:
+        logger.warning(f"Failed to clear old cache files: {e}")
+
+
+def get_cache_info(cache_dir):
+    """Get information about the cache directory."""
+    try:
+        if not os.path.exists(cache_dir):
+            return "Cache directory does not exist"
+
+        files = os.listdir(cache_dir)
+        total_size = sum(os.path.getsize(os.path.join(cache_dir, f)) for f in files if os.path.isfile(os.path.join(cache_dir, f)))
+
+        return {
+            "cache_dir": cache_dir,
+            "file_count": len(files),
+            "total_size_mb": total_size / (1024 * 1024)
+        }
+    except Exception as e:
+        return f"Error getting cache info: {e}"
+
+
+def cleanup_corrupted_cache(cache_dir):
+    """Remove corrupted cache files to prevent future loading failures."""
+    try:
+        corrupted_files = []
+        for filename in os.listdir(cache_dir):
+            if filename.endswith('.pkl'):
+                file_path = os.path.join(cache_dir, filename)
+                if not validate_cache_integrity(file_path):
+                    corrupted_files.append(filename)
+                    os.remove(file_path)
+
+        if corrupted_files:
+            logger.info(f"Cleaned up {len(corrupted_files)} corrupted cache files")
+        return len(corrupted_files)
+    except Exception as e:
+        logger.warning(f"Failed to cleanup corrupted cache: {e}")
+        return 0
 
 
 def parse_args():
@@ -244,6 +385,33 @@ def main():
     args = OmegaConf.load(parse_args())
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
 
+        # Initialize cache system
+    cache_dir = os.environ.get('QWEN_CACHE', os.path.expanduser('~/.cache/qwen_quantized'))
+    if args.quantize:
+        logger.info(f"Using quantized model cache directory: {cache_dir}")
+        cache_info = get_cache_info(cache_dir)
+        logger.info(f"Cache info: {cache_info}")
+
+        # Check available disk space
+        try:
+            import shutil
+            total, used, free = shutil.disk_usage(cache_dir)
+            free_gb = free / (1024**3)
+            logger.info(f"Available disk space: {free_gb:.2f} GB")
+
+            if free_gb < 1.0:  # Less than 1GB free
+                logger.warning("Low disk space detected. Consider clearing old cache files.")
+        except Exception as e:
+            logger.warning(f"Could not check disk space: {e}")
+
+        # Optionally clear old cache files (uncomment if needed)
+        # clear_old_cache_files(cache_dir, max_age_days=7)
+
+        # Clean up corrupted cache files automatically
+        corrupted_count = cleanup_corrupted_cache(cache_dir)
+        if corrupted_count > 0:
+            logger.info(f"Automatically cleaned up {corrupted_count} corrupted cache files")
+
     # Initialize W&B tracking with more comprehensive config
     wandb_config = {
         key: value for key, value in args.items() if key not in ['wandb_run_name', 'wandb_project_name', 'wandb_entity', 'wandb_tags']
@@ -381,16 +549,32 @@ def main():
     if args.quantize:
         torch_dtype = weight_dtype
         device = accelerator.device
-        all_blocks = list(flux_transformer.transformer_blocks)
-        print(f"Quantizing {len(all_blocks)} blocks")
-        for block in tqdm(all_blocks):
-            block.to(device, dtype=torch_dtype)
-            quantize(block, weights=qfloat8)
-            freeze(block)
-            block.to('cpu')
-        flux_transformer.to(device, dtype=torch_dtype)
-        quantize(flux_transformer, weights=qfloat8)
-        freeze(flux_transformer)
+
+        # Try to load from cache first
+        cache_path = get_quantized_model_cache_path(
+            args.pretrained_model_name_or_path,
+            str(weight_dtype),
+            args.rank
+        )
+
+        if validate_cache_integrity(cache_path) and load_quantized_model(flux_transformer, cache_path):
+            logger.info("Successfully loaded quantized model from cache")
+        else:
+            logger.info("Cache miss - quantizing model from scratch")
+            all_blocks = list(flux_transformer.transformer_blocks)
+            print(f"Quantizing {len(all_blocks)} blocks")
+            for block in tqdm(all_blocks):
+                block.to(device, dtype=torch_dtype)
+                quantize(block, weights=qfloat8)
+                freeze(block)
+                block.to('cpu')
+            flux_transformer.to(device, dtype=torch_dtype)
+            quantize(flux_transformer, weights=qfloat8)
+            freeze(flux_transformer)
+
+            # Save to cache for future use
+            save_quantized_model(flux_transformer, cache_path)
+
         #quantize(flux_transformer, weights=qint8, activations=qint8)
         #freeze(flux_transformer)
 
