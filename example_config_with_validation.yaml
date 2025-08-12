@@ -1,0 +1,86 @@
+# Example configuration file with validation support
+# This shows how to configure validation for both training scripts
+
+# Model configuration
+pretrained_model_name_or_path: "Qwen/Qwen2.5-VL-7B-Instruct"
+output_dir: "./output"
+logging_dir: "logs"
+
+# Training configuration
+max_train_steps: 1000
+train_batch_size: 1
+gradient_accumulation_steps: 4
+learning_rate: 1e-4
+lr_scheduler: "constant"
+lr_warmup_steps: 100
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_weight_decay: 1e-2
+adam_epsilon: 1e-08
+max_grad_norm: 1.0
+
+# LoRA configuration
+rank: 16
+
+# Checkpointing
+checkpointing_steps: 100
+checkpoints_total_limit: 3
+
+# Mixed precision
+mixed_precision: "fp16"
+
+# Quantization (for 4090 script)
+quantize: false
+adam8bit: false
+
+# Precomputation options
+precompute_text_embeddings: true
+precompute_image_embeddings: true
+
+# Data configuration for training
+data_config:
+  img_dir: "./training_data"
+  img_size: 1024
+  train_batch_size: 1
+
+# Validation configuration
+# This block configures the validation dataset and parameters
+validation_config:
+  img_dir: "./validation_data"  # Directory containing validation images and text files
+  img_size: 1024                # Resolution for validation images (can be different from training)
+  train_batch_size: 1           # Batch size for validation (can be different from training)
+
+  # Optional: You can specify different preprocessing for validation
+  # For example, if you want to use different augmentation or different image sizes
+  # img_size: 512  # Smaller validation images for faster validation
+
+  # Optional: You can also specify different text processing if needed
+  # max_sequence_length: 1024  # Override default text length for validation
+
+# W&B tracking configuration
+report_to: "wandb"
+tracker_project_name: "flymyai-lora-training"
+wandb_project_name: "flymyai-lora-training"
+wandb_run_name: "training-with-validation"
+wandb_entity: "your-username"
+wandb_tags: ["lora", "qwen", "validation"]
+
+# Example of how validation works:
+# 1. During training, validation loss is computed:
+#    - At each checkpoint save (every checkpointing_steps)
+#    - At the end of each epoch
+# 2. Validation loss is logged to:
+#    - Console output
+#    - W&B tracking
+# 3. Validation metrics include:
+#    - checkpoint_validation_loss: computed at checkpoints
+#    - epoch_validation_loss: computed at end of each epoch
+#    - Both are logged with corresponding global_step and epoch numbers
+
+# Notes:
+# - Validation dataset should have the same structure as training data
+# - Images should be in .png or .jpg format
+# - Text prompts should be in corresponding .txt files
+# - Validation batch size can be different from training batch size
+# - Validation image resolution can be different from training resolution
+# - If precompute_*_embeddings is true, validation embeddings will also be precomputed

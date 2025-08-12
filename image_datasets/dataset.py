@@ -56,11 +56,12 @@ def crop_to_aspect_ratio(image, ratio="16:9"):
 
 
 class CustomImageDataset(Dataset):
-    def __init__(self, img_dir, img_size=512, caption_type='txt',
+    def __init__(self, img_dir, img_size=512, img_repeats=10, caption_type='txt',
                  random_ratio=False, caption_dropout_rate=0.1, cached_text_embeddings=None,
                  cached_image_embeddings=None):
         self.images = [os.path.join(img_dir, i) for i in os.listdir(img_dir) if '.jpg' in i or '.png' in i]
         self.images.sort()
+        self.img_repeats = img_repeats
         self.img_size = img_size
         self.caption_type = caption_type
         self.random_ratio = random_ratio
@@ -68,14 +69,20 @@ class CustomImageDataset(Dataset):
         self.cached_text_embeddings = cached_text_embeddings
         self.cached_image_embeddings = cached_image_embeddings
         print('cached_text_embeddings', type(cached_text_embeddings))
+
     def __len__(self):
-        return 999999
+        """Return the actual number of images in the dataset."""
+        return len(self.images) * self.img_repeats
 
     def __getitem__(self, idx):
+        """Get item by index, with looping."""
+        idx = idx % len(self.images) # does not include repeats because of the modulo operation
+
         try:
-            idx = random.randint(0, len(self.images) - 1)
+            # Use the actual index instead of random selection
+            img_path = self.images[idx]
             if self.cached_image_embeddings is None:
-                img = Image.open(self.images[idx]).convert('RGB')
+                img = Image.open(img_path).convert('RGB')
                 if self.random_ratio:
                     ratio = random.choice(["16:9", "default", "1:1", "4:3"])
                     if ratio != "default":
@@ -88,8 +95,8 @@ class CustomImageDataset(Dataset):
                 img = torch.from_numpy((np.array(img) / 127.5) - 1)
                 img = img.permute(2, 0, 1)
             else:
-                img = self.cached_image_embeddings[self.images[idx].split('/')[-1]]
-            txt_path = self.images[idx].split('.')[0] + '.' + self.caption_type
+                img = self.cached_image_embeddings[img_path.split('/')[-1]]
+            txt_path = img_path.split('.')[0] + '.' + self.caption_type
             if self.cached_text_embeddings is None:
                 prompt = open(txt_path).read()
                 if throw_one(self.caption_dropout_rate):
@@ -103,8 +110,12 @@ class CustomImageDataset(Dataset):
                 else:
                     return img, self.cached_text_embeddings[txt]['prompt_embeds'], self.cached_text_embeddings[txt]['prompt_embeds_mask']
         except Exception as e:
-            print(e)
-            return self.__getitem__(random.randint(0, len(self.images) - 1))
+            print(f"Error loading sample {idx}: {e}")
+            # Return a fallback sample instead of infinite recursion
+            if idx > 0:
+                return self.__getitem__(idx - 1)
+            else:
+                raise
 
 def loader(train_batch_size, num_workers, **args):
     dataset = CustomImageDataset(**args)

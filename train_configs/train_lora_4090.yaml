@@ -7,17 +7,31 @@ data_config:
   img_dir: ./your_lora_dataset
   random_ratio: false # support multi crop preprocessing
   caption_type: txt
-report_to: null
+report_to: wandb
+wandb_project_name: qwen-lora-training
+wandb_run_name: lora-4090-run
+wandb_entity: null  # Set to your W&B username/team if desired
+wandb_tags: ["lora", "qwen", "text-to-image", "4090"]
 train_batch_size: 1
 output_dir: ./test_lora_saves
 max_train_steps: 3000
 learning_rate: 3e-4
 lr_scheduler: constant
 lr_warmup_steps: 10
-adam_beta1: 0.9
-adam_beta2: 0.999
-adam_weight_decay: 0.01
-adam_epsilon: 1e-8
+
+# Optimizer configuration - supports Adam, Adafactor, and Prodigy
+optimizer: adam  # Options: adam, adafactor, prodigy
+optimizer_args:
+  # Common parameters
+  betas: [0.9, 0.999]
+  weight_decay: 0.01
+  epsilon: 1e-8
+
+  # Prodigy-specific parameters
+  use_bias_correction: true
+  safeguard_warmup: true
+  d_coef: 0.1  # D-adaptation coefficient
+
 max_grad_norm: 1.0
 logging_dir: logs
 mixed_precision: "bf16"
