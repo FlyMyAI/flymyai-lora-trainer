@@ -69,10 +69,10 @@ def test_lora_checkpoint_loading():
             )
 
             # Store original base model weights for comparison
+            # We need to store them before adding the LoRA adapter
             original_weights = {}
             for name, param in model.named_parameters():
-                if 'lora' not in name:
-                    original_weights[name] = param.data.clone()
+                original_weights[name] = param.data.clone()
 
             print(f"Stored {len(original_weights)} base model parameters")
 

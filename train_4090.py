@@ -474,6 +474,28 @@ def compute_validation_loss(flux_transformer, vae, text_encoding_pipeline, noise
     return avg_val_loss
 
 
+def get_prodigy_d_coef(optimizer, fallback_d_coef):
+    """Extract the current D coefficient from the Prodigy optimizer's state.
+
+    Args:
+        optimizer: The Prodigy optimizer instance
+        fallback_d_coef: Not used, kept for compatibility
+
+    Returns:
+        float or None: The current D coefficient from the optimizer state, or None if not accessible
+    """
+    if not hasattr(optimizer, 'param_groups') or len(optimizer.param_groups) == 0:
+        return None
+
+    # Access the D coefficient from the first parameter group's state
+    group = optimizer.param_groups[0]
+    # d_coef = group.get('d_coef', None)
+    d_val = group.get('d', None)
+    # print("D coef: ", d_coef, "D val: ", d_val)
+
+    return d_val
+
+
 def main():
     args = OmegaConf.load(parse_args())
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
@@ -516,6 +538,17 @@ def main():
     # Add optimizer-specific parameters to W&B config
     if hasattr(args, 'optimizer_args'):
         wandb_config["optimizer_args"] = args.optimizer_args
+
+    # Add optimizer type to W&B config
+    wandb_config["optimizer_type"] = getattr(args, 'optimizer', 'adam').lower()
+
+    # Add Prodigy-specific config if using Prodigy
+    if wandb_config["optimizer_type"] == 'prodigy' and hasattr(args, 'optimizer_args'):
+        prodigy_args = args.optimizer_args
+        if 'd_coef' in prodigy_args:
+            # Only add to config if we can actually access the real D coefficient
+            # The real value will be logged during training when accessible
+            wandb_config["prodigy_base_lr"] = args.learning_rate
 
     # Add validation config to W&B if available
     if hasattr(args, 'validation_config') and args.validation_config is not None:
@@ -707,6 +740,9 @@ def main():
     # Set up optimizer based on configuration
     optimizer_type = getattr(args, 'optimizer', 'adam').lower()
 
+    # Initialize variables for Prodigy optimizer logging
+    d_coef = None
+
     for n, param in flux_transformer.named_parameters():
         if 'lora' not in n:
             param.requires_grad = False
@@ -753,12 +789,10 @@ def main():
                 optimizer = Adafactor(
                     lora_layers,
                     lr=args.learning_rate,
-                    betas=tuple(optimizer_args.get('betas', [0.9, 0.999])),
                     weight_decay=optimizer_args.get('weight_decay', 0.01),
-                    eps=optimizer_args.get('epsilon', 1e-8),
                     scale_parameter=optimizer_args.get('scale_parameter', True),
-                    relative_step=optimizer_args.get('relative_step', True),
-                    warmup_init=optimizer_args.get('warmup_init', True),
+                    relative_step=optimizer_args.get('relative_step', False),
+                    warmup_init=optimizer_args.get('warmup_init', False),
                 )
             except ImportError:
                 logger.warning("Adafactor not available, falling back to AdamW")
@@ -776,18 +810,23 @@ def main():
                 from prodigyopt import Prodigy
                 # Prodigy uses three beta values
                 betas = optimizer_args.get('betas', [0.9, 0.999])
-                if len(betas) == 2:
-                    betas = betas + [optimizer_args.get('beta3', 0.999)]
+                # if len(betas) == 2:
+                #     betas = betas + [optimizer_args.get('beta3', 0.999)]j
 
+                # Store D coefficient for logging
+                d_coef = optimizer_args.get('d_coef', 1.5)
+
+                # "decouple=True" "weight_decay=0.1" "betas=0.9,0.999" "use_bias_correction=False" "safeguard_warmup=False"
                 optimizer = Prodigy(
                     lora_layers,
                     lr=args.learning_rate,
+                    d_coef=d_coef,
+                    decouple=True,
+                    weight_decay=optimizer_args.get('weight_decay', 0.1),
                     betas=tuple(betas),
-                    weight_decay=optimizer_args.get('weight_decay', 0.01),
-                    eps=optimizer_args.get('epsilon', 1e-8),
-                    use_bias_correction=optimizer_args.get('use_bias_correction', True),
-                    safeguard_warmup=optimizer_args.get('safeguard_warmup', True),
-                    d_coef=optimizer_args.get('d_coef', 0.1),
+                    # eps=optimizer_args.get('epsilon', 1e-8),
+                    use_bias_correction=optimizer_args.get('use_bias_correction', False),
+                    safeguard_warmup=optimizer_args.get('safeguard_warmup', False),
                 )
             except ImportError:
                 raise ImportError("Prodigy not available, please install it with `pip install prodigyopt`")
@@ -804,6 +843,22 @@ def main():
             )
 
     logger.info(f"Using {optimizer_type.title()} optimizer")
+    if optimizer_type == 'prodigy' and d_coef is not None:
+        # Get current D coefficient from the optimizer's state (this is the dynamic value)
+        current_d_coef = get_prodigy_d_coef(optimizer, d_coef)
+        if current_d_coef is not None:
+            current_real_lr = args.learning_rate * current_d_coef
+            logger.info(f"Prodigy D coefficient: {current_d_coef}")
+            logger.info(f"Prodigy real learning rate (LR * D_coef): {current_real_lr:.2e}")
+
+            # Add Prodigy-specific metrics to W&B config for tracking
+            if accelerator.is_main_process:
+                accelerator.log({
+                    "prodigy_d_coef": current_d_coef,
+                    "prodigy_real_lr": current_real_lr,
+                    "prodigy_base_lr": args.learning_rate,
+                }, step=0)
+
     train_dataloader = loader(cached_text_embeddings=cached_text_embeddings, cached_image_embeddings=cached_image_embeddings, **args.data_config)
 
     # Setup validation dataset if validation_config is provided
@@ -1115,12 +1170,27 @@ def main():
                 # Get current learning rate
                 current_lr = lr_scheduler.get_last_lr()[0]
 
-                # Log comprehensive metrics to W&B
-                accelerator.log({
+                # Prepare logging metrics
+                log_metrics = {
                     "train_loss": train_loss,
                     "learning_rate": current_lr,
                     "epoch_progress": epoch_step_count / steps_per_epoch,
-                }, step=global_step)
+                }
+
+                # Add Prodigy-specific metrics if using Prodigy optimizer
+                if optimizer_type == 'prodigy' and d_coef is not None:
+                    # Get current D coefficient from the optimizer's state (this is the dynamic value)
+                    current_d_coef = get_prodigy_d_coef(optimizer, d_coef)
+                    if current_d_coef is not None:
+                        # Calculate real learning rate dynamically at each step
+                        current_real_lr = current_lr * current_d_coef
+                        log_metrics.update({
+                            "prodigy_d_coef": current_d_coef,
+                            "prodigy_real_lr": current_real_lr,
+                        })
+
+                # Log comprehensive metrics to W&B
+                accelerator.log(log_metrics, step=global_step)
 
                 train_loss = 0.0
 
@@ -1190,10 +1260,24 @@ def main():
                         logger.info(f"Checkpoint validation completed at step {global_step}: {val_loss:.6f}")
 
                         # Log validation loss to W&B
-                        accelerator.log({
+                        checkpoint_log_metrics = {
                             "checkpoint_validation_loss": val_loss,
                             "epoch_progress": epoch_step_count / steps_per_epoch,
-                        }, step=global_step)
+                        }
+
+                        # Add Prodigy-specific metrics if using Prodigy optimizer
+                        if optimizer_type == 'prodigy' and d_coef is not None:
+                            # Get current D coefficient from the optimizer's state (this is the dynamic value)
+                            current_d_coef = get_prodigy_d_coef(optimizer, d_coef)
+                            if current_d_coef is not None:
+                                # Calculate real learning rate dynamically
+                                current_real_lr = lr_scheduler.get_last_lr()[0] * current_d_coef
+                                checkpoint_log_metrics.update({
+                                    "prodigy_d_coef": current_d_coef,
+                                    "prodigy_real_lr": current_real_lr,
+                                })
+
+                        accelerator.log(checkpoint_log_metrics, step=global_step)
 
                         # Clean up temporary text pipeline if we created one
                         if val_text_pipeline is not None and val_text_pipeline != text_encoding_pipeline:
@@ -1201,6 +1285,19 @@ def main():
                             torch.cuda.empty_cache()
 
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+
+            # Add Prodigy-specific metrics to progress bar if using Prodigy
+            if optimizer_type == 'prodigy' and d_coef is not None:
+                # Get current D coefficient from the optimizer's state (this is the dynamic value)
+                current_d_coef = get_prodigy_d_coef(optimizer, d_coef)
+                if current_d_coef is not None:
+                    # Calculate real learning rate dynamically
+                    current_real_lr = lr_scheduler.get_last_lr()[0] * current_d_coef
+                    logs.update({
+                        "d_coef": current_d_coef,
+                        "real_lr": f"{current_real_lr:.2e}"
+                    })
+
             progress_bar.set_postfix(**logs)
 
             if global_step >= args.max_train_steps:
@@ -1238,10 +1335,24 @@ def main():
                 logger.info(f"Epoch {current_epoch} validation completed: {val_loss:.6f}")
 
                 # Log epoch validation loss to W&B
-                accelerator.log({
+                epoch_val_log_metrics = {
                     "epoch_validation_loss": val_loss,
                     "epoch_progress": epoch_step_count / steps_per_epoch,
-                }, step=global_step)
+                }
+
+                # Add Prodigy-specific metrics if using Prodigy optimizer
+                if optimizer_type == 'prodigy' and d_coef is not None:
+                    # Get current D coefficient from the optimizer's state (this is the dynamic value)
+                    current_d_coef = get_prodigy_d_coef(optimizer, d_coef)
+                    if current_d_coef is not None:
+                        # Calculate real learning rate dynamically
+                        current_real_lr = lr_scheduler.get_last_lr()[0] * current_d_coef
+                        epoch_val_log_metrics.update({
+                            "prodigy_d_coef": current_d_coef,
+                            "prodigy_real_lr": current_real_lr,
+                        })
+
+                accelerator.log(epoch_val_log_metrics, step=global_step)
 
                 # Clean up temporary text pipeline if we created one
                 if val_text_pipeline is not None and val_text_pipeline != text_encoding_pipeline:
@@ -1256,6 +1367,14 @@ def main():
                 if validation_dataloader:
                     logger.info(f"  - Validation loss: {val_loss:.6f}")
                 logger.info(f"  - Current learning rate: {lr_scheduler.get_last_lr()[0]:.2e}")
+                if optimizer_type == 'prodigy' and d_coef is not None:
+                    # Get current D coefficient from the optimizer's state (this is the dynamic value)
+                    current_d_coef = get_prodigy_d_coef(optimizer, d_coef)
+                    if current_d_coef is not None:
+                        # Calculate real learning rate dynamically
+                        current_real_lr = lr_scheduler.get_last_lr()[0] * current_d_coef
+                        logger.info(f"  - Prodigy D coefficient: {current_d_coef}")
+                        logger.info(f"  - Prodigy real learning rate: {current_real_lr:.2e}")
                 logger.info(f"  - Global step: {global_step}")
                 logger.info(f"  - Progress: {global_step}/{args.max_train_steps} ({100*global_step/args.max_train_steps:.1f}%)")
 
@@ -1265,6 +1384,14 @@ def main():
         logger.info(f"Total steps: {global_step}")
         logger.info(f"Total epochs: {current_epoch}")
         logger.info(f"Final learning rate: {lr_scheduler.get_last_lr()[0]:.2e}")
+        if optimizer_type == 'prodigy' and d_coef is not None:
+            # Get current D coefficient from the optimizer's state (this is the dynamic value)
+            current_d_coef = get_prodigy_d_coef(optimizer, d_coef)
+            if current_d_coef is not None:
+                # Calculate final real learning rate dynamically
+                final_real_lr = lr_scheduler.get_last_lr()[0] * current_d_coef
+                logger.info(f"Final Prodigy D coefficient: {current_d_coef}")
+                logger.info(f"Final Prodigy real learning rate: {final_real_lr:.2e}")
 
 
     accelerator.wait_for_everyone()
