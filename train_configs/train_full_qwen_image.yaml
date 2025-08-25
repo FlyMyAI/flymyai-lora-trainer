@@ -1,0 +1,48 @@
+# Full Training Configuration for Qwen Image Model
+pretrained_model_name_or_path: Qwen/Qwen-Image
+
+# Data configuration
+data_config:
+  train_batch_size: 1
+  num_workers: 4
+  img_size: 1024
+  caption_dropout_rate: 0.1
+  img_dir: ./path/to/your/dataset
+  random_ratio: false
+  caption_type: txt
+
+# Training parameters
+train_batch_size: 1
+output_dir: ./output_full_training
+max_train_steps: 10000
+num_train_epochs: 1
+
+# Optimizer settings
+learning_rate: 5e-5  # Lower learning rate for full training
+use_8bit_adam: true  # Use 8-bit Adam to save memory
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_weight_decay: 0.01
+adam_epsilon: 1e-8
+
+# Learning rate scheduler
+lr_scheduler: cosine_with_restarts
+lr_warmup_steps: 1000
+
+# Gradient settings
+max_grad_norm: 1.0
+gradient_accumulation_steps: 1  # Increase for effective batch size
+
+# Precision and memory
+mixed_precision: "bf16"  # Use bfloat16 for better stability
+freeze_text_encoder: true  # Keep text encoder frozen to save memory
+
+# Logging and checkpointing
+logging_dir: logs
+report_to: null  # Can be "wandb", "tensorboard", etc.
+checkpointing_steps: 500
+checkpoints_total_limit: 5
+tracker_project_name: qwen_image_full_training
+
+# Resume training
+resume_from_checkpoint: latest

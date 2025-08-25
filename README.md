@@ -206,6 +206,17 @@ accelerate launch train.py --config ./train_configs/train_lora.yaml
 
 Make sure `train_lora.yaml` is correctly set up with paths to your dataset, model, output directory, and other parameters.
 
+
+### Qwen-Image Full Training
+
+To begin training with your configuration file (e.g., `train_full_qwen_image.yaml`), run:
+
+```bash
+accelerate launch train.py --config ./train_configs/train_full_qwen_image.yaml
+```
+
+Make sure `train_full_qwen_image.yaml` is correctly set up with paths to your dataset, model, output directory, and other parameters.
+
 ### Qwen-Image-Edit LoRA Training
 
 For control-based image editing training, use the specialized training script:
