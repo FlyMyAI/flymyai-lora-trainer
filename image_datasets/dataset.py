@@ -96,7 +96,7 @@ class CustomImageDataset(Dataset):
                 img = self.cached_image_embeddings[self.images[idx].split('/')[-1]]
             txt_path = self.images[idx].rsplit('.', 1)[0] + '.' + self.caption_type
             if self.cached_text_embeddings is None and self.txt_cache_dir is None:
-                prompt = open(txt_path).read()
+                prompt = open(txt_path, encoding='utf-8').read()
                 if throw_one(self.caption_dropout_rate):
                     return img, " "
                 else:

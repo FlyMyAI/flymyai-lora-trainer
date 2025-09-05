@@ -109,7 +109,7 @@ class CustomImageDataset(Dataset):
                 
             txt_path = self.images[idx].split('.')[0] + '.' + self.caption_type
             if self.cached_text_embeddings is None:
-                prompt = open(txt_path).read()
+                prompt = open(txt_path, encoding='utf-8').read()
                 if throw_one(self.caption_dropout_rate):
                     return img, " ", control_img
                 else:

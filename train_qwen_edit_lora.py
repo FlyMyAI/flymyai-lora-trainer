@@ -169,7 +169,7 @@ def main():
                 calculated_width, calculated_height, _ = calculate_dimensions(1024 * 1024, img.size[0] / img.size[1])
                 prompt_image = text_encoding_pipeline.image_processor.resize(img, calculated_height, calculated_width)
                 
-                prompt = open(txt_path).read()
+                prompt = open(txt_path, encoding='utf-8').read()
                 prompt_embeds, prompt_embeds_mask = text_encoding_pipeline.encode_prompt(
                     image=prompt_image,
                     prompt=[prompt],

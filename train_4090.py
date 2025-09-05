@@ -148,7 +148,7 @@ def main():
                 cached_text_embeddings = {}
             for txt in tqdm([i for i in os.listdir(args.data_config.img_dir) if ".txt" in i]):
                 txt_path = os.path.join(args.data_config.img_dir, txt)
-                prompt = open(txt_path).read()
+                prompt = open(txt_path, encoding="utf-8").read()
                 prompt_embeds, prompt_embeds_mask = text_encoding_pipeline.encode_prompt(
                     prompt=[prompt],
                     device=text_encoding_pipeline.device,
