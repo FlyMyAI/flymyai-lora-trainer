@@ -59,7 +59,7 @@ class CustomImageDataset(Dataset):
     def __init__(self, img_dir, img_size=512, caption_type='txt',
                  random_ratio=False, caption_dropout_rate=0.1, cached_text_embeddings=None,
                  cached_image_embeddings=None, control_dir=None, cached_image_embeddings_control=None):
-        self.images = [os.path.join(img_dir, i) for i in os.listdir(img_dir) if '.jpg' in i or '.png' in i]
+        self.images = [os.path.join(img_dir, i) for i in os.listdir(img_dir) if i.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))]
         self.images.sort()
         self.img_size = img_size
         self.caption_type = caption_type
