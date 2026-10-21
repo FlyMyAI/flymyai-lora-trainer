@@ -1,7 +1,9 @@
 pretrained_model_name_or_path: Qwen/Qwen-Image
+model_revision: 75e0b4be04f60ec59a75f475837eced720f823b6
+seed: 42
 data_config:
   train_batch_size: 1
-  num_workers: 4
+  num_workers: 0
   img_size: 1024
   caption_dropout_rate: 0.1
   img_dir: ./your_lora_dataset

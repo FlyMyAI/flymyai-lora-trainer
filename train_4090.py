@@ -1,492 +1,373 @@
+"""Resumable, single-GPU Qwen-Image LoRA training with persistent checkpoints."""
 import argparse
-import copy
-from copy import deepcopy
+from contextlib import contextmanager
+import gc
+import hashlib
+from importlib import metadata
+import json
 import logging
 import os
-import shutil
+from pathlib import Path
+import random
+import tempfile
 
-import torch
-from tqdm.auto import tqdm
-
-from accelerate import Accelerator
-from accelerate.logging import get_logger
-from accelerate.utils import ProjectConfiguration
-import datasets
-import diffusers
-from diffusers import FlowMatchEulerDiscreteScheduler
-from diffusers import (
-    AutoencoderKLQwenImage,
-    QwenImagePipeline,
-    QwenImageTransformer2DModel,
-)
-from diffusers.optimization import get_scheduler
-from diffusers.training_utils import (
-    compute_density_for_timestep_sampling,
-    compute_loss_weighting_for_sd3,
-)
-from diffusers.utils import convert_state_dict_to_diffusers
-from diffusers.utils.torch_utils import is_compiled_module
-from image_datasets.dataset import loader, image_resize
-from omegaconf import OmegaConf
-from peft import LoraConfig
-from peft.utils import get_peft_model_state_dict
-import transformers
-from PIL import Image
 import numpy as np
-from optimum.quanto import quantize, qfloat8, freeze
-import bitsandbytes as bnb
-logger = get_logger(__name__, log_level="INFO")
-from diffusers.loaders import AttnProcsLayers
-import gc
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="Simple example of a training script.")
-    parser.add_argument(
-        "--config",
-        type=str,
-        default=None,
-        required=True,
-        help="path to config",
-    )
-    args = parser.parse_args()
-
-
-    return args.config
-
+from omegaconf import OmegaConf
+from PIL import Image
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 
-class ToyDataset(Dataset):
-    def __init__(self, num_samples=100, input_dim=10):
-        self.data = torch.randn(num_samples, input_dim)    # random features
-        self.labels = torch.randint(0, 2, (num_samples,))  # random labels: 0 or 1
+from utils.training_checkpoint import load_checkpoint, resolve_checkpoint, restore_checkpoint_state, save_checkpoint
+from utils.training_data import (
+    CachedTrainingDataset, atomic_torch_save, cache_is_valid, dataset_fingerprint,
+    list_training_samples, write_cache_signature,
+)
+from utils.training_runtime import (
+    StopRequest, build_run_signature, infinite_batches, train_steps, validate_training_config,
+)
 
-    def __getitem__(self, idx):
-        return self.data[idx], self.labels[idx]
-
-    def __len__(self):
-        return len(self.data)
-
-def lora_processors(model):
-    processors = {}
-
-    def fn_recursive_add_processors(name: str, module: torch.nn.Module, processors):
-        if 'lora' in name:
-            processors[name] = module
-            print(name)
-        for sub_name, child in module.named_children():
-            fn_recursive_add_processors(f"{name}.{sub_name}", child, processors)
-
-        return processors
-
-    for name, module in model.named_children():
-        fn_recursive_add_processors(name, module, processors)
-
-    return processors
-
-def main():
-    args = OmegaConf.load(parse_args())
-    logging_dir = os.path.join(args.output_dir, args.logging_dir)
-
-    accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
-
-    accelerator = Accelerator(
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        mixed_precision=args.mixed_precision,
-        log_with=args.report_to,
-        project_config=accelerator_project_config,
-    )
-    def unwrap_model(model):
-        model = accelerator.unwrap_model(model)
-        model = model._orig_mod if is_compiled_module(model) else model
-        return model
-
-    # Make one log on every process with the configuration for debugging.
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        level=logging.INFO,
-    )
-    logger.info(accelerator.state, main_process_only=False)
-    if accelerator.is_local_main_process:
-        datasets.utils.logging.set_verbosity_warning()
-        transformers.utils.logging.set_verbosity_warning()
-        diffusers.utils.logging.set_verbosity_info()
-    else:
-        datasets.utils.logging.set_verbosity_error()
-        transformers.utils.logging.set_verbosity_error()
-        diffusers.utils.logging.set_verbosity_error()
+LOGGER = logging.getLogger(__name__)
+MODEL_REVISION = "75e0b4be04f60ec59a75f475837eced720f823b6"
 
 
-    if accelerator.is_main_process:
-        if args.output_dir is not None:
-            os.makedirs(args.output_dir, exist_ok=True)
-    weight_dtype = torch.float32
-    if accelerator.mixed_precision == "fp16":
-        weight_dtype = torch.float16
-        args.mixed_precision = accelerator.mixed_precision
-    elif accelerator.mixed_precision == "bf16":
-        weight_dtype = torch.bfloat16
-        args.mixed_precision = accelerator.mixed_precision
-    text_encoding_pipeline = QwenImagePipeline.from_pretrained(
-        args.pretrained_model_name_or_path, transformer=None, vae=None, torch_dtype=weight_dtype
-    )
-    text_encoding_pipeline.to(accelerator.device)
-    cached_text_embeddings = None
-    txt_cache_dir = None
-    if args.precompute_text_embeddings or args.precompute_image_embeddings:
-        if accelerator.is_main_process:
-            cache_dir = os.path.join(args.output_dir, "cache")
-            os.makedirs(cache_dir, exist_ok=True)
-        accelerator.wait_for_everyone()
-        cache_dir = os.path.join(args.output_dir, "cache")
-    if args.precompute_text_embeddings:
-        with torch.no_grad():
-            if args.save_cache_on_disk:
-                txt_cache_dir = os.path.join(cache_dir, "text_embs")
-                os.makedirs(txt_cache_dir, exist_ok=True)
-            else:
-                cached_text_embeddings = {}
-            for txt in tqdm([i for i in os.listdir(args.data_config.img_dir) if ".txt" in i]):
-                txt_path = os.path.join(args.data_config.img_dir, txt)
-                prompt = open(txt_path, encoding="utf-8").read()
-                prompt_embeds, prompt_embeds_mask = text_encoding_pipeline.encode_prompt(
-                    prompt=[prompt],
-                    device=text_encoding_pipeline.device,
-                    num_images_per_prompt=1,
-                    max_sequence_length=1024,
-                )
-                if args.save_cache_on_disk:
-                    torch.save({'prompt_embeds': prompt_embeds[0].to('cpu'), 'prompt_embeds_mask': prompt_embeds_mask[0].to('cpu')}, os.path.join(txt_cache_dir, txt + '.pt'))
-                else:
-                    cached_text_embeddings[txt] = {'prompt_embeds': prompt_embeds[0].to('cpu'), 'prompt_embeds_mask': prompt_embeds_mask[0].to('cpu')}
-            # compute empty embedding
-            prompt_embeds, prompt_embeds_mask = text_encoding_pipeline.encode_prompt(
-                prompt=[' '],
-                device=text_encoding_pipeline.device,
-                num_images_per_prompt=1,
-                max_sequence_length=1024,
-            )
-            if args.save_cache_on_disk:
-                torch.save({'prompt_embeds': prompt_embeds[0].to('cpu'), 'prompt_embeds_mask': prompt_embeds_mask[0].to('cpu')}, os.path.join(txt_cache_dir, 'empty_embedding.pt'))
-                del prompt_embeds
-                del prompt_embeds_mask
-            else:
-                cached_text_embeddings['empty_embedding'] = {'prompt_embeds': prompt_embeds[0].to('cpu'), 'prompt_embeds_mask': prompt_embeds_mask[0].to('cpu')}
-                    
-        text_encoding_pipeline.to("cpu")
-        torch.cuda.empty_cache()
-    del text_encoding_pipeline
-    gc.collect()
-
-    
-    vae = AutoencoderKLQwenImage.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="vae",
-    )
-    vae.to(accelerator.device, dtype=weight_dtype)
-    cached_image_embeddings = None
-    img_cache_dir = None
-    if args.precompute_image_embeddings:
-        if args.save_cache_on_disk:
-            img_cache_dir = os.path.join(cache_dir, "img_embs")
-            os.makedirs(img_cache_dir, exist_ok=True)
-        else:
-            cached_image_embeddings = {}
-        with torch.no_grad():
-            for img_name in tqdm([i for i in os.listdir(args.data_config.img_dir) if ".png" in i or ".jpg" in i]):
-                img = Image.open(os.path.join(args.data_config.img_dir, img_name)).convert('RGB')
-                img = image_resize(img, args.data_config.img_size)
-                w, h = img.size
-                new_w = (w // 32) * 32
-                new_h = (h // 32) * 32
-                img = img.resize((new_w, new_h))
-                img = torch.from_numpy((np.array(img) / 127.5) - 1)
-                img = img.permute(2, 0, 1).unsqueeze(0)
-                pixel_values = img.unsqueeze(2)
-                pixel_values = pixel_values.to(dtype=weight_dtype).to(accelerator.device)
-        
-                pixel_latents = vae.encode(pixel_values).latent_dist.sample().to('cpu')[0]
-                if args.save_cache_on_disk:
-                    torch.save(pixel_latents, os.path.join(img_cache_dir, img_name + '.pt'))
-                    del pixel_latents
-                else:
-                    cached_image_embeddings[img_name] = pixel_latents
-        vae.to('cpu')
-        torch.cuda.empty_cache()
-    #del vae
-    gc.collect()
-    flux_transformer = QwenImageTransformer2DModel.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="transformer",    )
-    if args.quantize:
-        torch_dtype = weight_dtype
-        device = accelerator.device
-        all_blocks = list(flux_transformer.transformer_blocks)
-        for block in tqdm(all_blocks):
-            block.to(device, dtype=torch_dtype)
-            quantize(block, weights=qfloat8)
-            freeze(block)
-            block.to('cpu')
-        flux_transformer.to(device, dtype=torch_dtype)
-        quantize(flux_transformer, weights=qfloat8)
-        freeze(flux_transformer)
-        #quantize(flux_transformer, weights=qint8, activations=qint8)
-        #freeze(flux_transformer)
-        
-    lora_config = LoraConfig(
-        r=args.rank,
-        lora_alpha=args.rank,
-        init_lora_weights="gaussian",
-        target_modules=["to_k", "to_q", "to_v", "to_out.0"],
-    )
-    flux_transformer.to(accelerator.device)
-    #flux_transformer.add_adapter(lora_config)
-    noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="scheduler",
-    )
-    if args.quantize:
-        flux_transformer.to(accelerator.device)
-    else:
-        flux_transformer.to(accelerator.device, dtype=weight_dtype)
-    flux_transformer.add_adapter(lora_config)
-    noise_scheduler_copy = copy.deepcopy(noise_scheduler)
-    def get_sigmas(timesteps, n_dim=4, dtype=torch.float32):
-        sigmas = noise_scheduler_copy.sigmas.to(device=accelerator.device, dtype=dtype)
-        schedule_timesteps = noise_scheduler_copy.timesteps.to(accelerator.device)
-        timesteps = timesteps.to(accelerator.device)
-        step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
-    
-        sigma = sigmas[step_indices].flatten()
-        while len(sigma.shape) < n_dim:
-            sigma = sigma.unsqueeze(-1)
-        return sigma
-        
-    flux_transformer.requires_grad_(False)
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", required=True, help="YAML training recipe")
+    parser.add_argument("--dataset-dir", help="Override data_config.img_dir")
+    parser.add_argument("--output-dir", help="Override output_dir (persistent disk)")
+    parser.add_argument("--max-train-steps", type=int, help="Total optimizer-step target; keep unchanged when resuming")
+    parser.add_argument("--stop-after-steps", type=int, help="Gracefully stop after this many optimizer steps in this session")
+    parser.add_argument("--resume-from-checkpoint", help="latest, checkpoint path, or none")
+    parser.add_argument("--preflight", action="store_true", help="Validate config/dataset/checkpoint selection without CUDA or downloads")
+    return parser.parse_args(argv)
 
 
-    flux_transformer.train()
-    optimizer_cls = torch.optim.AdamW
-    for n, param in flux_transformer.named_parameters():
-        if 'lora' not in n:
-            param.requires_grad = False
+def load_config(cli):
+    config = OmegaConf.to_container(OmegaConf.load(cli.config), resolve=True)
+    config.setdefault("model_revision", MODEL_REVISION)
+    config.setdefault("seed", 42)
+    config.setdefault("max_sequence_length", 1024)
+    if cli.dataset_dir:
+        config["data_config"]["img_dir"] = cli.dataset_dir
+    if cli.output_dir:
+        config["output_dir"] = cli.output_dir
+    if cli.max_train_steps is not None:
+        config["max_train_steps"] = cli.max_train_steps
+    if cli.resume_from_checkpoint is not None:
+        config["resume_from_checkpoint"] = cli.resume_from_checkpoint
+    if config.get("resume_from_checkpoint") == "none":
+        config["resume_from_checkpoint"] = None
+    if cli.stop_after_steps is not None and cli.stop_after_steps <= 0:
+        raise ValueError("--stop-after-steps must be positive")
+    validate_training_config(config)
+    return config
+
+
+def runtime_versions():
+    versions = {}
+    for name in ("torch", "diffusers", "peft", "transformers", "optimum-quanto",
+                 "bitsandbytes", "numpy", "Pillow", "huggingface-hub"):
+        try:
+            versions[name] = metadata.version(name)
+        except metadata.PackageNotFoundError:
             pass
-        else:
-            param.requires_grad = True
-            print(n)
-    print(sum([p.numel() for p in flux_transformer.parameters() if p.requires_grad]) / 1000000, 'parameters')
-    lora_layers = filter(lambda p: p.requires_grad, flux_transformer.parameters())
-    lora_layers_model = AttnProcsLayers(lora_processors(flux_transformer))
-    flux_transformer.enable_gradient_checkpointing()
-    if args.adam8bit:
-        optimizer = bnb.optim.Adam8bit(lora_layers,
-            lr=args.learning_rate,
-            betas=(args.adam_beta1, args.adam_beta2),)
+    direct_url = metadata.distribution("diffusers").read_text("direct_url.json")
+    if direct_url:
+        versions["diffusers_commit"] = json.loads(direct_url).get("vcs_info", {}).get("commit_id")
+    return versions
+
+
+@contextmanager
+def output_lock(output_dir):
+    import fcntl
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with (output_dir / ".training.lock").open("a") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise ValueError(f"Another trainer is using {output_dir}") from error
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def _resize(image, maximum):
+    scale = maximum / max(image.size)
+    width, height = (int(side * scale) // 32 * 32 for side in image.size)
+    if min(width, height) < 32:
+        raise ValueError("Image aspect ratio is too extreme for this img_size")
+    return image.resize((width, height))
+
+
+def prepare_caches(config, samples, data_hash, device, dtype, stop):
+    """Reuse completed files after interruption; publish each file atomically."""
+    from diffusers import AutoencoderKLQwenImage, QwenImagePipeline
+    recipe = {
+        "model": config["pretrained_model_name_or_path"], "revision": config["model_revision"],
+        "dataset": data_hash, "seed": config["seed"], "img_size": config["data_config"]["img_size"],
+        "max_sequence_length": config["max_sequence_length"], "dtype": str(dtype),
+        "versions": runtime_versions(), "format": 1,
+    }
+    namespace = hashlib.sha256(json.dumps(recipe, sort_keys=True).encode()).hexdigest()[:24]
+    root = Path(config["output_dir"]) / "cache" / namespace
+    text_dir, image_dir = root / "text", root / "image"
+    required_text = [sample.caption_cache_name for sample in samples] + ["empty_embedding.pt"]
+    required_image = [sample.image_cache_name for sample in samples]
+    model_kwargs = {"revision": config["model_revision"], "torch_dtype": dtype}
+    stop.raise_if_requested()
+    if not cache_is_valid(text_dir, recipe, required_text):
+        write_cache_signature(text_dir, recipe)
+        pipeline = QwenImagePipeline.from_pretrained(
+            config["pretrained_model_name_or_path"], transformer=None, vae=None, **model_kwargs,
+        ).to(device)
+        captions = [(sample.caption_cache_name, sample.caption_path.read_text(encoding="utf-8")) for sample in samples]
+        for name, prompt in captions + [("empty_embedding.pt", " ")]:
+            stop.raise_if_requested()
+            if cache_is_valid(text_dir, recipe, [name]):
+                continue
+            with torch.no_grad():
+                embedding, mask = pipeline.encode_prompt(
+                    prompt=[prompt], device=device, num_images_per_prompt=1,
+                    max_sequence_length=config["max_sequence_length"],
+                )
+            atomic_torch_save({"prompt_embeds": embedding[0].cpu(), "prompt_embeds_mask": mask[0].cpu()}, text_dir / name)
+            stop.raise_if_requested()
+        del pipeline
+        gc.collect()
+        torch.cuda.empty_cache()
+    vae_config = AutoencoderKLQwenImage.load_config(
+        config["pretrained_model_name_or_path"], subfolder="vae", revision=config["model_revision"],
+    )
+    if not cache_is_valid(image_dir, recipe, required_image):
+        write_cache_signature(image_dir, recipe)
+        vae = AutoencoderKLQwenImage.from_pretrained(
+            config["pretrained_model_name_or_path"], subfolder="vae", **model_kwargs,
+        ).to(device)
+        for sample in samples:
+            stop.raise_if_requested()
+            if cache_is_valid(image_dir, recipe, [sample.image_cache_name]):
+                continue
+            with Image.open(sample.image_path) as image:
+                image = _resize(image.convert("RGB"), config["data_config"]["img_size"])
+                pixels = torch.from_numpy(np.array(image).astype(np.float32) / 127.5 - 1)
+            pixels = pixels.permute(2, 0, 1).unsqueeze(0).unsqueeze(2).to(device=device, dtype=dtype)
+            image_seed = int(hashlib.sha256(f"{config['seed']}:{sample.image_path.name}".encode()).hexdigest()[:16], 16)
+            generator = torch.Generator(device=device).manual_seed(image_seed)
+            with torch.no_grad():
+                latent = vae.encode(pixels).latent_dist.sample(generator=generator)[0].cpu()
+            atomic_torch_save(latent, image_dir / sample.image_cache_name)
+            stop.raise_if_requested()
+        del vae
+        gc.collect()
+        torch.cuda.empty_cache()
+    if not cache_is_valid(text_dir, recipe, required_text) or not cache_is_valid(image_dir, recipe, required_image):
+        raise ValueError("Embedding cache did not finish correctly")
+    vae_config = dict(vae_config)
+    vae_config["vae_scale_factor"] = 2 ** len(vae_config["temperal_downsample"])
+    return image_dir, text_dir, vae_config
+
+
+def qwen_flow_loss(model, batch, scheduler, vae_config, device, dtype):
+    """Original Qwen flow-matching objective, exercised with a tiny CPU model."""
+    from diffusers import QwenImagePipeline
+    from diffusers.training_utils import compute_density_for_timestep_sampling
+    latent, embedding, mask = batch
+    latent = latent.to(device=device, dtype=dtype).permute(0, 2, 1, 3, 4)
+    channels = vae_config["z_dim"]
+    mean = torch.tensor(vae_config["latents_mean"], device=device, dtype=dtype).view(1, 1, channels, 1, 1)
+    std = torch.tensor(vae_config["latents_std"], device=device, dtype=dtype).view(1, 1, channels, 1, 1)
+    latent = (latent - mean) / std
+    batch_size = latent.shape[0]
+    noise = torch.randn_like(latent)
+    density = compute_density_for_timestep_sampling(
+        weighting_scheme="none", batch_size=batch_size, logit_mean=0.0, logit_std=1.0, mode_scale=1.29,
+    )
+    indices = (density * scheduler.config.num_train_timesteps).long()
+    timesteps = scheduler.timesteps[indices].to(device)
+    sigma = scheduler.sigmas[indices].to(device=device, dtype=dtype).view(batch_size, 1, 1, 1, 1)
+    noisy = (1 - sigma) * latent + sigma * noise
+    packed = QwenImagePipeline._pack_latents(noisy, batch_size, channels, noisy.shape[3], noisy.shape[4])
+    embedding = embedding.to(device=device, dtype=dtype)
+    mask = mask.to(device=device, dtype=torch.int32)
+    predicted = model(
+        hidden_states=packed, timestep=timesteps / 1000, guidance=None,
+        encoder_hidden_states_mask=mask, encoder_hidden_states=embedding,
+        img_shapes=[(1, noisy.shape[3] // 2, noisy.shape[4] // 2)] * batch_size,
+        txt_seq_lens=mask.sum(dim=1).tolist(), return_dict=False,
+    )[0]
+    scale = vae_config["vae_scale_factor"]
+    predicted = QwenImagePipeline._unpack_latents(predicted, noisy.shape[3] * scale, noisy.shape[4] * scale, scale)
+    target = (noise - latent).permute(0, 2, 1, 3, 4)
+    return (predicted.float() - target.float()).square().mean()
+
+
+def ensure_inference_export(checkpoint_path, adapters):
+    """Regenerate derived inference weights atomically, including after a killed export."""
+    from diffusers import QwenImagePipeline
+    checkpoint_path = Path(checkpoint_path)
+    with tempfile.TemporaryDirectory(prefix=".export-", dir=checkpoint_path.parent) as temporary:
+        QwenImagePipeline.save_lora_weights(temporary, transformer_lora_layers=adapters)
+        source = Path(temporary) / "pytorch_lora_weights.safetensors"
+        with source.open("rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(source, checkpoint_path / source.name)
+
+
+def extract_adapter_state(model):
+    # PEFT's default first calls model.state_dict(), unpacking the entire FP8 base.
+    # Passing only trainable parameters avoids both that allocation and base serialization.
+    from peft.utils import get_peft_model_state_dict
+    return get_peft_model_state_dict(model, state_dict={
+        name: parameter for name, parameter in model.named_parameters() if parameter.requires_grad
+    }, save_embedding_layers=False)
+
+
+def quantize_qwen_transformer(model, device):
+    from optimum.quanto import freeze, qfloat8, quantize
+    from tqdm.auto import tqdm
+    for block in tqdm(model.transformer_blocks, desc="Quantizing transformer"):
+        block.to(device)
+        quantize(block, weights=qfloat8)
+        freeze(block)
+        block.to("cpu")
+    # CUDA autocast runs norm_out in FP32. Native Linear casts that output to
+    # BF16; Quanto's Marlin kernel bypasses autocast and rejects FP32 inputs.
+    quantize(model, weights=qfloat8, exclude=["proj_out"])
+    freeze(model)
+
+
+def train(config, samples, data_hash, signature, resume_path, stop_after_steps, stop):
+    from diffusers import FlowMatchEulerDiscreteScheduler, QwenImageTransformer2DModel
+    from diffusers.optimization import get_scheduler
+    from peft import LoraConfig
+    from peft.utils import set_peft_model_state_dict
+    from tqdm.auto import tqdm
+    output_dir = Path(config["output_dir"])
+    payload = load_checkpoint(resume_path, signature) if resume_path else None
+    global_step = payload["global_step"] if payload else 0
+    if global_step == config["max_train_steps"]:
+        ensure_inference_export(resume_path, payload["adapter_state"])
+        LOGGER.info("Training already complete at step %s: %s", global_step, resume_path)
+        return 0
+    if not torch.cuda.is_available():
+        raise ValueError("CUDA GPU required for training; use --preflight or CPU tests on Mac")
+    if torch.cuda.device_count() != 1:
+        raise ValueError("Expose exactly one GPU, for example with CUDA_VISIBLE_DEVICES, for this recipe")
+    device, dtype = torch.device("cuda:0"), torch.bfloat16
+    if not torch.cuda.is_bf16_supported():
+        raise ValueError("This recipe requires a BF16-capable CUDA GPU")
+    random.seed(config["seed"])
+    np.random.seed(config["seed"])
+    torch.manual_seed(config["seed"])
+    image_dir, text_dir, vae_config = prepare_caches(config, samples, data_hash, device, dtype, stop)
+    stop.raise_if_requested()
+    model = QwenImageTransformer2DModel.from_pretrained(
+        config["pretrained_model_name_or_path"], subfolder="transformer",
+        revision=config["model_revision"], torch_dtype=dtype,
+    )
+    model.requires_grad_(False)
+    if config["quantize"]:
+        quantize_qwen_transformer(model, device)
+    model.requires_grad_(False)
+    model.to(device)
+    # Cache hits/misses and model construction must not change fresh LoRA initialization.
+    random.seed(config["seed"])
+    np.random.seed(config["seed"])
+    torch.manual_seed(config["seed"])
+    model.add_adapter(LoraConfig(
+        r=config["rank"], lora_alpha=config["rank"], init_lora_weights="gaussian",
+        target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+    ))
+    parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    for parameter in parameters:
+        parameter.data = parameter.data.float()
+    stop.raise_if_requested()
+    model.enable_gradient_checkpointing()
+    if config["adam8bit"]:
+        import bitsandbytes as bnb
+        optimizer_type = bnb.optim.AdamW8bit
     else:
-        optimizer = optimizer_cls(
-            lora_layers,
-            lr=args.learning_rate,
-            betas=(args.adam_beta1, args.adam_beta2),
-            weight_decay=args.adam_weight_decay,
-            eps=args.adam_epsilon,
-        )
-    train_dataloader = loader(cached_text_embeddings=cached_text_embeddings, cached_image_embeddings=cached_image_embeddings, 
-                              txt_cache_dir=txt_cache_dir, img_cache_dir=img_cache_dir, **args.data_config)
-
-    lr_scheduler = get_scheduler(
-        args.lr_scheduler,
-        optimizer=optimizer,
-        num_warmup_steps=args.lr_warmup_steps * accelerator.num_processes,
-        num_training_steps=args.max_train_steps * accelerator.num_processes,
+        optimizer_type = torch.optim.AdamW
+    optimizer = optimizer_type(parameters, lr=config["learning_rate"],
+        betas=(config["adam_beta1"], config["adam_beta2"]),
+        weight_decay=config["adam_weight_decay"], eps=config["adam_epsilon"])
+    scheduler = get_scheduler(config["lr_scheduler"], optimizer,
+        num_warmup_steps=config["lr_warmup_steps"], num_training_steps=config["max_train_steps"])
+    noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+        config["pretrained_model_name_or_path"], subfolder="scheduler", revision=config["model_revision"],
     )
-    global_step = 0
-    dataset1 = ToyDataset(num_samples=100, input_dim=10)
-    dataloader1 = DataLoader(dataset1, batch_size=8, shuffle=True)
+    dataset = CachedTrainingDataset(samples, image_dir, text_dir, config["data_config"]["caption_dropout_rate"])
+    loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0,
+        generator=torch.Generator().manual_seed(config["seed"]))
+    batches = infinite_batches(loader)
+    if payload:
+        if set(payload["adapter_state"]) != set(extract_adapter_state(model)):
+            raise ValueError("Checkpoint adapter keys do not match this model")
+        loaded = set_peft_model_state_dict(model, payload["adapter_state"])
+        if loaded.unexpected_keys:
+            raise ValueError(f"Unexpected adapter keys: {loaded.unexpected_keys}")
+        restore_checkpoint_state(payload, optimizer, scheduler)
+        LOGGER.info("Resumed %s at optimizer step %s", resume_path, global_step)
+    (output_dir / "run_manifest.json").write_text(json.dumps({
+        "signature": signature, "gpu": torch.cuda.get_device_name(device),
+        "cuda": torch.version.cuda, "resumed_from": str(resume_path) if resume_path else None,
+    }, indent=2) + "\n", encoding="utf-8")
+    progress = tqdm(total=config["max_train_steps"], initial=global_step, desc="Optimizer steps")
 
-    lora_layers_model, optimizer, _, lr_scheduler = accelerator.prepare(
-        lora_layers_model, optimizer, dataloader1, lr_scheduler
-    )
+    def checkpoint(step):
+        adapters = extract_adapter_state(model)
+        path = save_checkpoint(output_dir, step, adapters, optimizer, scheduler, signature,
+            checkpoints_total_limit=config.get("checkpoints_total_limit", 3))
+        # Export is derived; a killed export does not invalidate the full checkpoint.
+        ensure_inference_export(path, adapters)
+        LOGGER.info("Saved complete checkpoint and inference weights: %s", path)
 
-    initial_global_step = 0
+    def on_step(step, loss):
+        progress.update(1)
+        progress.set_postfix(loss=loss)
+        with (output_dir / "metrics.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"step": step, "loss": loss, "lr": scheduler.get_last_lr()[0],
+                "session_start_step": global_step,
+                "peak_vram_bytes": torch.cuda.max_memory_allocated(device)}) + "\n")
 
-    if accelerator.is_main_process:
-        accelerator.init_trackers(args.tracker_project_name, {"test": None})
+    try:
+        result = train_steps(model, optimizer, scheduler, batches,
+            lambda batch: qwen_flow_loss(model, batch, noise_scheduler, vae_config, device, dtype),
+            global_step=global_step, max_train_steps=config["max_train_steps"],
+            gradient_accumulation_steps=config["gradient_accumulation_steps"],
+            checkpointing_steps=config["checkpointing_steps"], save_checkpoint=checkpoint,
+            stop_after_steps=stop_after_steps, stop_request=stop,
+            max_grad_norm=config["max_grad_norm"],
+            autocast=lambda: torch.autocast("cuda", dtype=dtype), on_step=on_step)
+    finally:
+        progress.close()
+    LOGGER.info("Stopped at optimizer step %s (%s)", result.global_step, result.reason)
+    return 128 + stop.signum if result.reason == "signal" else 0
 
-    total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
-    logger.info("***** Running training *****")
-    logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
-    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
-    logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
-    progress_bar = tqdm(
-        range(0, args.max_train_steps),
-        initial=initial_global_step,
-        desc="Steps",
-        disable=not accelerator.is_local_main_process,
-    )
-    vae_scale_factor = 2 ** len(vae.temperal_downsample)
-    for epoch in range(1):
-        train_loss = 0.0
-        for step, batch in enumerate(train_dataloader):
-            with accelerator.accumulate(flux_transformer):
-                if args.precompute_text_embeddings:
-                    img, prompt_embeds, prompt_embeds_mask = batch
-                    prompt_embeds, prompt_embeds_mask = prompt_embeds.to(dtype=weight_dtype).to(accelerator.device), prompt_embeds_mask.to(dtype=torch.int32).to(accelerator.device)
-                else:
-                    img, prompts = batch
-                with torch.no_grad():
-                    if not args.precompute_image_embeddings:
-                        pixel_values = img.to(dtype=weight_dtype).to(accelerator.device)
-                        pixel_values = pixel_values.unsqueeze(2)
-    
-                        pixel_latents = vae.encode(pixel_values).latent_dist.sample()
-                    else:
-                        pixel_latents = img.to(dtype=weight_dtype).to(accelerator.device)
-                    pixel_latents = pixel_latents.permute(0, 2, 1, 3, 4)
-
-                    latents_mean = (
-                        torch.tensor(vae.config.latents_mean)
-                        .view(1, 1, vae.config.z_dim, 1, 1)
-                        .to(pixel_latents.device, pixel_latents.dtype)
-                    )
-                    latents_std = 1.0 / torch.tensor(vae.config.latents_std).view(1, 1, vae.config.z_dim, 1, 1).to(
-                        pixel_latents.device, pixel_latents.dtype
-                    )
-                    pixel_latents = (pixel_latents - latents_mean) * latents_std
-                    
-
-                    bsz = pixel_latents.shape[0]
-                    noise = torch.randn_like(pixel_latents, device=accelerator.device, dtype=weight_dtype)
-                    u = compute_density_for_timestep_sampling(
-                        weighting_scheme="none",
-                        batch_size=bsz,
-                        logit_mean=0.0,
-                        logit_std=1.0,
-                        mode_scale=1.29,
-                    )
-                    indices = (u * noise_scheduler_copy.config.num_train_timesteps).long()
-                    timesteps = noise_scheduler_copy.timesteps[indices].to(device=pixel_latents.device)
-
-                sigmas = get_sigmas(timesteps, n_dim=pixel_latents.ndim, dtype=pixel_latents.dtype)
-                noisy_model_input = (1.0 - sigmas) * pixel_latents + sigmas * noise
-                # Concatenate across channels.
-                # pack the latents.
-                packed_noisy_model_input = QwenImagePipeline._pack_latents(
-                    noisy_model_input,
-                    bsz, 
-                    noisy_model_input.shape[2],
-                    noisy_model_input.shape[3],
-                    noisy_model_input.shape[4],
-                )
-                # latent image ids for RoPE.
-                img_shapes = [(1, noisy_model_input.shape[3] // 2, noisy_model_input.shape[4] // 2)] * bsz
-                with torch.no_grad():
-                    if not args.precompute_text_embeddings:
-                        prompt_embeds, prompt_embeds_mask = text_encoding_pipeline.encode_prompt(
-                            prompt=prompts,
-                            device=packed_noisy_model_input.device,
-                            num_images_per_prompt=1,
-                            max_sequence_length=1024,
-                        )
-                    txt_seq_lens = prompt_embeds_mask.sum(dim=1).tolist()
-                model_pred = flux_transformer(
-                    hidden_states=packed_noisy_model_input,
-                    timestep=timesteps / 1000,
-                    guidance=None,
-                    encoder_hidden_states_mask=prompt_embeds_mask,
-                    encoder_hidden_states=prompt_embeds,
-                    img_shapes=img_shapes,
-                    txt_seq_lens=txt_seq_lens,
-                    return_dict=False,
-                )[0]
-                model_pred = QwenImagePipeline._unpack_latents(
-                    model_pred,
-                    height=noisy_model_input.shape[3] * vae_scale_factor,
-                    width=noisy_model_input.shape[4] * vae_scale_factor,
-                    vae_scale_factor=vae_scale_factor,
-                )
-                weighting = compute_loss_weighting_for_sd3(weighting_scheme="none", sigmas=sigmas)
-                # flow-matching loss
-                target = noise - pixel_latents
-                target = target.permute(0, 2, 1, 3, 4)
-                loss = torch.mean(
-                    (weighting.float() * (model_pred.float() - target.float()) ** 2).reshape(target.shape[0], -1),
-                    1,
-                )
-                loss = loss.mean()
-                # Gather the losses across all processes for logging (if we use distributed training).
-                avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
-                train_loss += avg_loss.item() / args.gradient_accumulation_steps
-
-                # Backpropagate
-                accelerator.backward(loss)
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(flux_transformer.parameters(), args.max_grad_norm)
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
-
-            # Checks if the accelerator has performed an optimization step behind the scenes
-            if accelerator.sync_gradients:
-                progress_bar.update(1)
-                global_step += 1
-                accelerator.log({"train_loss": train_loss}, step=global_step)
-                train_loss = 0.0
-
-                if global_step % args.checkpointing_steps == 0:
-                    if accelerator.is_main_process:
-                        # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
-                        if args.checkpoints_total_limit is not None:
-                            checkpoints = os.listdir(args.output_dir)
-                            checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
-                            checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
-
-                            # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
-                            if len(checkpoints) >= args.checkpoints_total_limit:
-                                num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
-                                removing_checkpoints = checkpoints[0:num_to_remove]
-
-                                logger.info(
-                                    f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
-                                )
-                                logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
-
-                                for removing_checkpoint in removing_checkpoints:
-                                    removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
-                                    shutil.rmtree(removing_checkpoint)
-
-                    save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-
-                    #accelerator.save_state(save_path)
-                    try:
-                        if not os.path.exists(save_path):
-                            os.mkdir(save_path)
-                    except:
-                        pass
-                    unwrapped_flux_transformer = unwrap_model(flux_transformer)
-                    flux_transformer_lora_state_dict = convert_state_dict_to_diffusers(
-                        get_peft_model_state_dict(unwrapped_flux_transformer)
-                    )
-
-                    QwenImagePipeline.save_lora_weights(
-                        save_path,
-                        flux_transformer_lora_state_dict,
-                        safe_serialization=True,
-                    )
-
-                    logger.info(f"Saved state to {save_path}")
-
-            logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
-            progress_bar.set_postfix(**logs)
-
-            if global_step >= args.max_train_steps:
-                break
-
-    accelerator.wait_for_everyone()
-    accelerator.end_training()
+def main(argv=None):
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    cli = parse_args(argv)
+    config = load_config(cli)
+    if int(os.environ.get("WORLD_SIZE", "1")) != 1:
+        raise ValueError("The resumable 4090 entry point supports exactly one GPU/process")
+    samples = list_training_samples(config["data_config"]["img_dir"], config["data_config"].get("caption_type", "txt"))
+    data_hash = dataset_fingerprint(samples)
+    output_dir = Path(config["output_dir"])
+    if cli.preflight:
+        resume_path = resolve_checkpoint(output_dir, config.get("resume_from_checkpoint"))
+        print(json.dumps({"samples": len(samples), "dataset_sha256": data_hash,
+            "model_revision": config["model_revision"], "output_dir": str(output_dir),
+            "resume_checkpoint": str(resume_path) if resume_path else None}, indent=2))
+        return 0
+    signature = build_run_signature(config, data_hash, runtime_versions())
+    with output_lock(output_dir), StopRequest() as stop:
+        resume_path = resolve_checkpoint(output_dir, config.get("resume_from_checkpoint"))
+        if resume_path is None and any(output_dir.glob("checkpoint-*")):
+            raise ValueError("Use a new output_dir for a fresh run; existing checkpoints must not be overwritten")
+        return train(config, samples, data_hash, signature, resume_path, cli.stop_after_steps, stop)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
