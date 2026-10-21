@@ -31,6 +31,7 @@ Agentic Infra for GenAI. FlyMy.AI is a B2B infrastructure for building and runni
 
 - LoRA-based fine-tuning for efficient training
 - Support for Qwen-Image, Qwen-Image-Edit, and FLUX.1-dev models
+- Qwen-Image LoRA training on a single RTX 4090 (24 GB), using FP8 weights and cached embeddings
 - Compatible with Hugging Face `diffusers`
 - Easy configuration via YAML
 - Control-based image editing with LoRA
@@ -73,6 +74,9 @@ Agentic Infra for GenAI. FlyMy.AI is a B2B infrastructure for building and runni
 
 ## 📦 Installation
 
+For Qwen-Image LoRA training on a single RTX 4090, see
+[Training on RTX 4090 (24 GB)](#-qwen-image-lora-training-on-rtx-4090-24-gb).
+
 **Requirements:**
 - Python 3.10
 
@@ -87,12 +91,10 @@ Agentic Infra for GenAI. FlyMy.AI is a B2B infrastructure for building and runni
    pip install -r requirements.txt
    ```
 
-3. Install the latest `diffusers` from GitHub:
-   ```bash
-   pip install git+https://github.com/huggingface/diffusers
-   ```
+   `requirements.txt` pins the Diffusers Git commit used by the trainer. Keep
+   that revision installed so checkpoint compatibility checks remain useful.
 
-4. Download pre-trained LoRA weights (optional):
+3. Download pre-trained LoRA weights (optional):
    ```bash
    # Qwen LoRA weights
    git clone https://huggingface.co/flymy-ai/qwen-image-realism-lora
@@ -204,15 +206,65 @@ This will check that:
 
 ---
 
-## 🏁 Start Training on < 24gb vram
+## 🏁 Qwen-Image LoRA training on RTX 4090 (24 GB)
 
-To begin training with your configuration file (e.g., `train_lora_4090.yaml`), run:
+`train_4090.py` trains Qwen-Image LoRA on one RTX 4090 using FP8 model weights,
+cached text and image embeddings, and batch size 1. Run it directly in one process:
 
 ```bash
-accelerate launch train_4090.py --config ./train_configs/train_lora_4090.yaml
+python train_4090.py --config ./train_configs/train_lora_4090.yaml \
+  --dataset-dir ./your_lora_dataset --output-dir ./output/my_lora
 ```
-![Sample Output](./assets/Valentin_24gb.jpg)
 
+Training has been validated on RTX 4090 24 GB at 512 px, rank 16, and batch
+size 1, including an 800-step run. To use that resolution, set
+`data_config.img_size: 512` in the YAML; the bundled configuration defaults to
+1024 px, which was not validated by that run.
+
+![Earlier training example on a 24 GB GPU](./assets/Valentin_24gb.jpg)
+
+### Training checks and recovery
+
+Before downloading model weights, validate your configuration, image/caption
+pairs, and checkpoint selection without CUDA:
+
+```bash
+python train_4090.py --config ./train_configs/train_lora_4090.yaml \
+  --dataset-dir ./your_lora_dataset --output-dir ./output/my_lora --preflight
+```
+
+Checkpoints allow a new process to continue training with the same configuration,
+dataset, and output path:
+
+```bash
+python train_4090.py --config ./train_configs/train_lora_4090.yaml \
+  --dataset-dir ./your_lora_dataset --output-dir ./output/my_lora \
+  --resume-from-checkpoint latest
+```
+
+`max_train_steps` is the total optimizer-step target across all sessions;
+`--max-train-steps` overrides it and must stay unchanged when resuming.
+Use `--stop-after-steps 100` to stop after 100 optimizer steps in the current
+session. This option, SIGINT, and SIGTERM save at the next complete optimizer
+update. After an abrupt termination, resume from the last complete checkpoint.
+
+<details>
+<summary>Checkpoint contents and compatibility</summary>
+
+Each `checkpoint-<step>` contains adapter weights, optimizer and scheduler state,
+RNG states, and integrity metadata. A separate `pytorch_lora_weights.safetensors`
+file supports inference. `latest` skips incomplete or corrupt checkpoints; older
+adapter-only checkpoints cannot resume training. Load full training checkpoints
+only from trusted runs because optimizer and RNG state use Python pickle.
+
+</details>
+
+This entry point requires one BF16-capable CUDA GPU, batch size 1,
+`num_workers: 0`, and disk-cached text and image embeddings. It currently supports
+`Qwen/Qwen-Image` only. The model revision, dataset contents, seed, training
+configuration, and recorded dependency versions must match the checkpoint.
+Keep the output directory on persistent storage and use a fresh directory for a
+new run.
 
 ## 🏁 Training
 

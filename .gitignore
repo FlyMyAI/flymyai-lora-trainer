@@ -8,6 +8,13 @@ __pycache__/
 env/
 venv/
 .venv/
+.venv-test/
+
+# Local training state and generated inputs
+output/
+test_lora_saves/
+cache/
+*.pt
 
 # Environment variables
 .env
